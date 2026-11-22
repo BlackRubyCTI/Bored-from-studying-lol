@@ -3,9 +3,10 @@
 **Zero-limit autonomous AI operating system.**
 A headless GPU compute pool, a sub-second inference path, and a phone-first mission control.
 
-> Milestones 1 to 3 of 5 are complete and verified:
+> Milestones 1 to 4 of 5 are complete and verified:
 > **M1** — control plane & resilient orchestrator · **M2** — self-benchmarking worker, mesh & tool sandbox ·
-> **M3** — headless compute spawner, VRAM auto-scaler & speculative pairing.
+> **M3** — headless compute spawner, VRAM auto-scaler & speculative pairing ·
+> **M4** — infinite memory & sleep-time self-evolution.
 
 ---
 
@@ -53,6 +54,27 @@ A headless GPU compute pool, a sub-second inference path, and a phone-first miss
 | Node hardware factor (`tokens/s × B`) so a hot-swap keeps the throughput estimate honest | `head_node/worker_registry.py` |
 | Seven new control-plane routes (`/v1/cluster/vram`, `/v1/models/plan`, `/v1/cluster/autoscale`, `/v1/speculative/pair`, `/v1/spawner`, `/v1/spawner/provision`, `/v1/spawner/rotate`) | `head_node/app.py` |
 | 181 tests, including **live auto-scaling and zero-downtime hand-overs** | `tests/` |
+
+### Milestone 4 — infinite memory & sleep-time self-evolution
+
+| Capability | Where |
+|---|---|
+| Persistent hybrid (vector + keyword) memory with atomic snapshots and restore | `memory/vector_memory.py` |
+| Durable-fact distillation from the conversations (`my name is …`, `we use …`, …) | `memory/vector_memory.py` |
+| Google Drive + Hugging Face Hub sync: resumable uploads, SHA-256 verification, newest-snapshot pull | `memory/sync.py` |
+| Automatic indexing of uploaded files (the API or a folder on disk) | `memory/vector_memory.py` |
+| Retrieval context injected into every request, exchanges written back to the memory | `head_node/orchestrator.py` |
+| **Sleep-time engine**: idle → mine → synthesise → self-play → train → merge → push → hot-reload | `training/autopilot_evolver.py` |
+| Deterministic synthetic data (audience / domain / format / risk / counterfactual mutations) | `training/synthetic_data.py` |
+| Self-play: fan-out drafting, critic scoring, similarity fallback, verified traces | `training/self_play.py` |
+| Federated, checkpointed QLoRA training with a weighted gradient average and an auto-merge | `training/distributed_trainer.py` |
+| The maths: ridge loss, int8 quantisation, truncated-SVD LoRA factorisation, `B @ A` merge | `training/qlora.py` |
+| Checkpoint streaming to Drive and the Hub (the training state outlives the disk) | `training/checkpoint_streamer.py` |
+| Prompt evolution: mutate, benchmark on held-out questions, promote only on a real gain | `training/prompt_evolver.py` |
+| Atomic brain hot-reload on every worker (a broken artifact never takes a worker down) | `worker/brain.py` |
+| **Strict preemption**: a chat interrupts the training and is served in **< 2 s** (measured: ~50 ms) | `training/autopilot_evolver.py` |
+| Eight new control-plane routes (`/v1/memory*`, `/v1/evolution/*`) | `head_node/app.py` |
+| 232 tests, including **live preemption of a running training** | `tests/` |
 
 ---
 
@@ -153,6 +175,12 @@ Everything is environment driven (`HYPER_*` prefix for the control plane,
 | `HYPER_SPAWNER_ENABLED` / `_PROVIDERS` / `_MIN_WORKERS` | the headless compute spawner and the provider order |
 | `HYPER_SPAWNER_DEFAULT_TTL_SECONDS` | session lifetime the provisioner asks the provider for |
 | `HYPER_CRED_KAGGLE_META` / `_HF_META` / `_GITHUB_META` / `_ORACLE_META` | per-account JSON metadata (owner, region, tenancy, compartment) |
+| `HYPER_MEMORY_ENABLED` / `HYPER_MEMORY_DIR` | the persistent memory on/off and where it lives |
+| `HYPER_DRIVE_FOLDER` / `HYPER_HUB_REPO` | where the memory snapshots and the checkpoints are mirrored |
+| `HYPER_DRIVE_TOKEN` / `HYPER_HUB_TOKEN` | credentials for the Drive / Hub sync |
+| `HYPER_EVOLUTION_ENABLED` / `_IDLE_SECONDS` | the sleep-time engine and how long the cluster must be idle |
+| `HYPER_EVOLUTION_PREEMPT_BUDGET_SECONDS` | the preemption budget (default 2 s) |
+| `HYPER_EVOLUTION_DATASET_SIZE` / `_TRAIN_STEPS` / `_MAX_SHARDS` | how much the cluster learns per idle window |
 
 Provider keys (`GROQ_API_KEY`, `CEREBRAS_API_KEY`, …) can be exported directly or registered
 through `POST /v1/credentials`; the vault stores them with `0600` permissions and rotates
@@ -163,11 +191,12 @@ between accounts automatically.
 ## Verification
 
 ```bash
-make test        # 181 tests: live HTTP/SSE servers, failover, sandbox, mesh, bootstrap, auto-scaler
-make lint        # ruff over core/head_node/worker/tools/tests/scripts
+make test        # 232 tests: live HTTP/SSE servers, failover, sandbox, mesh, bootstrap, auto-scaler, memory, self-evolution
+make lint        # ruff over core/head_node/worker/tools/memory/training/tests/scripts
 make smoke       # Milestone 1 smoke test (23 checks)
 make smoke-m2    # Milestone 2 smoke test (31 checks)
 make smoke-m3    # Milestone 3 smoke test (27 checks: hot-swap, scaling, zero-downtime hand-over)
+make smoke-m4    # Milestone 4 smoke test (40 checks: memory, cloud sync, self-evolution, instant preemption)
 ```
 
 ---
@@ -177,7 +206,7 @@ make smoke-m3    # Milestone 3 smoke test (27 checks: hot-swap, scaling, zero-do
 1. ✅ **Control plane & resilient orchestrator**
 2. ✅ **Self-benchmarking worker, mesh & tool sandbox**
 3. ✅ **Headless API compute spawner & VRAM auto-scaler**
-4. ⏳ Infinite memory & sleep-time self-evolution
+4. ✅ **Infinite memory & sleep-time self-evolution**
 5. ⏳ Mobile PWA mission control, phone alerts & one-command installer
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full blueprint.

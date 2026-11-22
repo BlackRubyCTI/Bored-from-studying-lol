@@ -32,6 +32,7 @@ class ThreadedServer:
     """Runs an ASGI app with uvicorn inside a background thread."""
 
     def __init__(self, app: Any, port: int) -> None:
+        self.app = app
         self.port = port
         self.base_url = f"http://127.0.0.1:{port}"
         config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", access_log=False)

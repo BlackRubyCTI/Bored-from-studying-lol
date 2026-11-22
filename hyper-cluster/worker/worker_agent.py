@@ -32,6 +32,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from core.http_client import LoopBoundClient
 from core.logging_setup import get_logger, setup_logging
 from core.protocol import (
     ChatCompletion,
@@ -44,6 +45,7 @@ from core.protocol import (
     WorkerHello,
     WorkerStatus,
 )
+from worker.brain import Brain
 from worker.config import WorkerConfig
 from worker.inference_engine import GenerationParams, InferenceEngine, ModelRuntime
 from worker.telemetry import Benchmarker, BenchmarkReport, capabilities_from_report
@@ -86,6 +88,8 @@ class WorkerAgent:
         if head_url:
             self.config.head_url = head_url.rstrip("/")
         self.worker_id = self.config.resolved_worker_id()
+        #: The LoRA brain installed by the sleep-time engine (hot-reloadable).
+        self.brain = Brain()
         self.engine = engine or InferenceEngine(
             backend=self.config.backend,
             upstream_url=self.config.upstream_url,
@@ -111,7 +115,7 @@ class WorkerAgent:
         self.queue_depth = 0
         self.total_requests = 0
         self.total_tokens = 0
-        self._client = httpx.AsyncClient(timeout=30.0)
+        self._http = LoopBoundClient(timeout=30.0)
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._register_task: asyncio.Task[None] | None = None
         self._backoff = self.config.reconnect_backoff_seconds
@@ -120,6 +124,11 @@ class WorkerAgent:
     # ------------------------------------------------------------------ #
     # Head-node plumbing
     # ------------------------------------------------------------------ #
+    @property
+    def _client(self) -> httpx.AsyncClient:
+        """The client of the loop that is running right now."""
+        return self._http.bind()
+
     def _headers(self) -> dict[str, str]:
         headers = {"content-type": "application/json"}
         if self.config.mesh_token:
@@ -315,7 +324,7 @@ class WorkerAgent:
                 headers=self._headers(),
             )
         with contextlib.suppress(Exception):
-            await self._client.aclose()
+            await self._http.aclose()
         self.status = WorkerStatus.DEAD
         LOGGER.info("worker stopped", extra={"hc_worker": self.worker_id})
 
@@ -323,7 +332,17 @@ class WorkerAgent:
     # Request handling
     # ------------------------------------------------------------------ #
     def _prompt_for(self, request: ChatRequest) -> str:
-        return build_prompt(request.messages)
+        """Render the prompt, primed with the brain when one is installed."""
+        messages = list(request.messages)
+        context = self.brain.context(request.to_prompt())
+        if context:
+            # The brain hint joins the system message (or becomes one).
+            system = next((m for m in messages if m.role == "system"), None)
+            if system is not None:
+                system.content = f"{system.content}\n\n{context}"
+            else:
+                messages.insert(0, ChatMessage(role="system", content=context))
+        return build_prompt(messages)
 
     def _params_for(self, request: ChatRequest) -> GenerationParams:
         return GenerationParams(
@@ -362,6 +381,7 @@ class WorkerAgent:
                 "backend": info.backend,
                 "draining": self.draining,
                 "inflight": self.inflight,
+                "brain": self.brain.info(),
                 "vram_free_gb": self.report.gpu.vram_free_gb if self.report and self.report.gpu else 0.0,
                 "vram_total_gb": self.report.gpu.vram_total_gb if self.report and self.report.gpu else 0.0,
                 "tokens_per_sec": info.last_tokens_per_sec,
@@ -484,6 +504,41 @@ class WorkerAgent:
                     loaded=False,
                     error=str(exc),
                 ).model_dump(mode="json")
+
+        @app.post("/v1/brain/load")
+        async def brain_load(payload: dict[str, Any]) -> Any:
+            """Hot-reload the trained brain (a base64 encoded LoRA artifact)."""
+            encoded = str(payload.get("artifact") or "")
+            if not encoded:
+                return JSONResponse(status_code=400, content={"error": "no artifact supplied"})
+            try:
+                info = self.brain.load(encoded)
+            except Exception as exc:  # noqa: BLE001 - a broken artifact is rejected
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": f"invalid artifact: {exc}", "worker_id": self.worker_id},
+                )
+            await self._broadcast_event("brain.loaded", info)
+            return {"ok": True, "worker_id": self.worker_id, "brain": info}
+
+        @app.post("/v1/train/shard")
+        async def train_shard(payload: dict[str, Any]) -> Any:
+            """Compute the gradient of one data shard (federated training)."""
+            from training.distributed_trainer import shard_gradient
+
+            try:
+                gradient, loss = shard_gradient(payload)
+            except Exception as exc:  # noqa: BLE001
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": f"invalid shard: {exc}", "worker_id": self.worker_id},
+                )
+            return {
+                "worker_id": self.worker_id,
+                "gradient": gradient,
+                "loss": loss,
+                "examples": len(payload.get("X") or []),
+            }
 
         @app.post("/v1/admin/drain")
         async def drain(payload: dict[str, Any] | None = None) -> Any:

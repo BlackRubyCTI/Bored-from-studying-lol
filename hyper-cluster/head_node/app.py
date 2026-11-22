@@ -18,6 +18,16 @@ Routes
 ``GET  /v1/queue``              hold-and-requeue buffer
 ``GET  /v1/credentials``        credential vault snapshot (admin)
 ``POST /v1/credentials``        register a provider account (admin)
+
+Milestone 4 -- the memory and the sleep-time engine:
+``GET  /v1/memory``             the state of the persistent memory
+``GET  /v1/memory/documents``   the indexed documents
+``POST /v1/memory/documents``   upload a file (it is indexed immediately)
+``POST /v1/memory/search``      hybrid retrieval over the memory
+``POST /v1/memory/sync``        push / pull the memory snapshot (admin)
+``GET  /v1/evolution/status``   the state of the sleep-time engine
+``POST /v1/evolution/run``      run one self-evolution cycle now (admin)
+``POST /v1/evolution/prompt``   set the system prompt of the cluster (admin)
 """
 
 from __future__ import annotations
@@ -27,7 +37,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -462,6 +472,149 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"unknown worker: {worker_id}")
         action = await engine.spawner.rotate(record)
         return action.to_dict()
+
+    # ------------------------------------------------------------------ #
+    # Memory and self-evolution (milestone 4)
+    # ------------------------------------------------------------------ #
+    def _require_memory() -> Any:
+        if engine.memory is None:
+            raise HTTPException(status_code=409, detail="the memory is disabled")
+        return engine.memory
+
+    @app.get("/v1/memory")
+    async def memory_status(_: str = Depends(require_client_auth)) -> dict[str, Any]:
+        """The state of the persistent memory."""
+        if engine.memory is None:
+            return {"enabled": False}
+        return {"enabled": True, **engine.memory.stats()}
+
+    @app.get("/v1/memory/documents")
+    async def memory_documents(_: str = Depends(require_client_auth)) -> dict[str, Any]:
+        """The documents that are indexed."""
+        memory = _require_memory()
+        return {"documents": [record.to_dict() for record in memory.documents()]}
+
+    @app.post("/v1/memory/search")
+    async def memory_search(
+        payload: dict[str, Any],
+        _: str = Depends(require_client_auth),
+    ) -> dict[str, Any]:
+        """Search the memory (hybrid retrieval)."""
+        memory = _require_memory()
+        query = str(payload.get("query") or "")
+        if not query:
+            raise HTTPException(status_code=422, detail="query is required")
+        hits = memory.search(
+            query,
+            k=int(payload.get("k") or 5),
+            sources=payload.get("sources") or None,
+        )
+        return {"query": query, "hits": [hit.to_dict() for hit in hits]}
+
+    @app.post("/v1/memory/documents")
+    async def memory_upload(
+        file: UploadFile = File(...),
+        _: str = Depends(require_client_auth),
+    ) -> dict[str, Any]:
+        """Upload a document -- it is indexed immediately."""
+        memory = _require_memory()
+        payload = await file.read()
+        if not payload:
+            raise HTTPException(status_code=422, detail="the uploaded file is empty")
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            raise HTTPException(status_code=415, detail="only text files can be indexed") from None
+        record = memory.add_document(
+            file.filename or "upload",
+            text,
+            metadata={"source_path": file.filename or "", "size": len(payload)},
+        )
+        return {"ok": True, "document": record.to_dict()}
+
+    @app.post("/v1/memory/sync")
+    async def memory_sync(
+        payload: dict[str, Any],
+        _: str = Depends(require_admin_auth),
+    ) -> dict[str, Any]:
+        """Push the memory to Drive / the Hub, or pull it back."""
+        memory = _require_memory()
+        action = str(payload.get("action") or "push")
+        targets = tuple(payload.get("targets") or ("drive", "hub"))
+        drive = None
+        hub = None
+        if "drive" in targets and resolved.drive_token:
+            from memory.sync import DriveClient
+
+            drive = DriveClient(
+                token=resolved.drive_token,
+                api_base=resolved.drive_api_base,
+                upload_base=resolved.drive_upload_base,
+            )
+        if "hub" in targets and resolved.hub_token and resolved.hub_repo:
+            from memory.sync import HubClient
+
+            hub = HubClient(token=resolved.hub_token, base_url=resolved.hub_base_url)
+        if drive is None and hub is None:
+            raise HTTPException(status_code=409, detail="no sync target is configured")
+        from memory.sync import MemorySync
+
+        sync = MemorySync(
+            drive=drive,
+            hub=hub,
+            drive_folder=resolved.drive_folder,
+            hub_repo=resolved.hub_repo,
+        )
+        try:
+            if action == "pull":
+                snapshots = await sync.pull(targets=targets)
+                restored = 0
+                for snapshot in snapshots:
+                    restored = memory.restore(snapshot)
+                return {"ok": True, "action": "pull", "restored": restored}
+            receipts = await sync.push(memory.snapshot(), targets=targets)
+            return {
+                "ok": True,
+                "action": "push",
+                "receipts": [receipt.to_dict() for receipt in receipts],
+            }
+        finally:
+            if drive is not None:
+                await drive.aclose()
+            if hub is not None:
+                await hub.aclose()
+
+    @app.get("/v1/evolution/status")
+    async def evolution_status(_: str = Depends(require_client_auth)) -> dict[str, Any]:
+        """The state of the sleep-time self-evolution engine."""
+        if engine.autopilot is None:
+            return {"enabled": False}
+        return {"enabled": True, **engine.autopilot.status()}
+
+    @app.post("/v1/evolution/run")
+    async def evolution_run(
+        payload: dict[str, Any],
+        _: str = Depends(require_admin_auth),
+    ) -> dict[str, Any]:
+        """Run one self-evolution cycle now."""
+        if engine.autopilot is None:
+            raise HTTPException(status_code=409, detail="the evolution engine is disabled")
+        report = await engine.autopilot.run_cycle(dataset_size=payload.get("dataset_size"))
+        return report.to_dict()
+
+    @app.post("/v1/evolution/prompt")
+    async def evolution_prompt(
+        payload: dict[str, Any],
+        _: str = Depends(require_admin_auth),
+    ) -> dict[str, Any]:
+        """Set the system prompt of the cluster."""
+        if engine.autopilot is None:
+            raise HTTPException(status_code=409, detail="the evolution engine is disabled")
+        prompt = str(payload.get("prompt") or "")
+        if not prompt:
+            raise HTTPException(status_code=422, detail="prompt is required")
+        engine.autopilot.system_prompt = prompt
+        return {"ok": True, "system_prompt": engine.autopilot.system_prompt}
 
     @app.post("/v1/credentials")
     async def add_credential(

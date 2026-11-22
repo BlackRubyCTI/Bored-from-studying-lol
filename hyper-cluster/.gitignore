@@ -23,7 +23,8 @@ models/
 *.gguf
 *.gguf.*
 credentials.json
-memory/
+# The runtime memory store lives under the data directory (data/ above);
+# memory/ is the *source* package and is tracked.
 checkpoints/
 
 # Editors / OS

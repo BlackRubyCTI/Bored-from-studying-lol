@@ -58,7 +58,9 @@ from head_node.request_store import RequestLedger
 from head_node.scheduler import Scheduler, SchedulerDecision
 from head_node.worker_client import WorkerClient
 from head_node.worker_registry import WorkerRecord, WorkerRegistry
+from memory.vector_memory import VectorMemory
 from tools.sandbox import ToolExecutor, build_tool_prompt, parse_tool_call
+from training.autopilot_evolver import AutopilotEvolver
 
 LOGGER = get_logger("head_node.orchestrator")
 
@@ -128,6 +130,8 @@ class Orchestrator:
         tools: ToolExecutor | None = None,
         selector: ModelSelector | None = None,
         spawner: AutoSpawner | None = None,
+        memory: VectorMemory | None = None,
+        autopilot: AutopilotEvolver | None = None,
     ) -> None:
         self.settings = settings if settings is not None else Settings.from_env()
         # NOTE: every collaborator is resolved with an explicit ``is not None``
@@ -174,12 +178,104 @@ class Orchestrator:
             if spawner is not None
             else AutoSpawner(self.settings, self.registry, vault=self.edge.vault)
         )
+        self.memory = (
+            memory
+            if memory is not None
+            else (
+                VectorMemory(
+                    self.settings.memory_dir,
+                    chunk_size=self.settings.memory_chunk_size,
+                    chunk_overlap=self.settings.memory_chunk_overlap,
+                    max_chunks=self.settings.memory_max_chunks,
+                )
+                if self.settings.memory_enabled
+                else None
+            )
+        )
+        self.autopilot = (
+            autopilot
+            if autopilot is not None
+            else self._build_autopilot()
+        )
         self._capacity_event = asyncio.Event()
         self._background: list[asyncio.Task[Any]] = []
         self._closing = False
         self._started_at = now_s()
         self._inflight = 0
         self._tokens_generated = 0
+
+    # ------------------------------------------------------------------ #
+    # The sleep-time engine
+    # ------------------------------------------------------------------ #
+    def _build_autopilot(self) -> AutopilotEvolver | None:
+        """Wire the sleep-time self-evolution engine (Milestone 4)."""
+        if not self.settings.evolution_enabled:
+            return None
+        from training.checkpoint_streamer import CheckpointStreamer
+        from training.distributed_trainer import DistributedTrainer
+        from training.prompt_evolver import PromptEvolver, load_prompt_from_memory
+        from training.self_play import SelfPlayEngine
+
+        trainer = DistributedTrainer(
+            checkpoint_dir=self.settings.evolution_checkpoint_dir,
+            dim=self.settings.evolution_train_dim,
+            rank=self.settings.evolution_train_rank,
+            vocab_size=self.settings.evolution_train_vocab,
+            learning_rate=self.settings.evolution_train_learning_rate,
+            steps=self.settings.evolution_train_steps,
+            shard_fn=self._shard_dispatch,
+        )
+        self_play = SelfPlayEngine(self.registry, self.client)
+        streamer: CheckpointStreamer | None = None
+        if self.settings.drive_token or self.settings.hub_token:
+            from memory.sync import DriveClient, HubClient
+
+            drive = (
+                DriveClient(
+                    token=self.settings.drive_token,
+                    api_base=self.settings.drive_api_base,
+                    upload_base=self.settings.drive_upload_base,
+                )
+                if self.settings.drive_token
+                else None
+            )
+            hub = (
+                HubClient(token=self.settings.hub_token, base_url=self.settings.hub_base_url)
+                if self.settings.hub_token and self.settings.hub_repo
+                else None
+            )
+            streamer = CheckpointStreamer(
+                drive=drive,
+                hub=hub,
+                drive_folder=self.settings.drive_folder,
+                hub_repo=self.settings.hub_repo,
+            )
+        prompt_evolver = PromptEvolver(
+            self.registry,
+            self.client,
+            baseline_prompt=load_prompt_from_memory(self.memory),
+        )
+        return AutopilotEvolver(
+            self.settings,
+            self.registry,
+            self.client,
+            memory=self.memory,
+            trainer=trainer,
+            self_play=self_play,
+            streamer=streamer,
+            prompt_evolver=prompt_evolver,
+            events=self.events,
+        )
+
+    def _shard_dispatch(self, payload: dict[str, Any]) -> Any:
+        """Send one training shard to a worker (round-robin over the mesh)."""
+        workers = self.registry.healthy_workers()
+        if not workers:
+            raise NoCapacityError("no worker is available for the training shard")
+        index = getattr(self, "_shard_cursor", 0)
+        self._shard_cursor = (index + 1) % len(workers)
+        record = workers[index % len(workers)]
+        return self.client.train_shard(record, payload)
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -193,6 +289,8 @@ class Orchestrator:
         self._background.append(asyncio.create_task(self._maintenance_loop(), name="hc-maintenance-loop"))
         self._background.append(asyncio.create_task(self._autoscale_loop(), name="hc-autoscale-loop"))
         self._background.append(asyncio.create_task(self._spawner_loop(), name="hc-spawner-loop"))
+        if self.autopilot is not None:
+            self.autopilot.start()
         LOGGER.info("orchestrator started", extra={"hc_workers": len(self.registry)})
 
     async def shutdown(self) -> None:
@@ -206,6 +304,8 @@ class Orchestrator:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
         self._background.clear()
+        if self.autopilot is not None:
+            await self.autopilot.aclose()
         await self.edge.aclose()
         await self.client.aclose()
         await self.spawner.aclose()
@@ -348,6 +448,7 @@ class Orchestrator:
     # ------------------------------------------------------------------ #
     async def submit(self, request: ChatRequest) -> ChatCompletion:
         """Run a request to completion (non-streaming)."""
+        self._user_activity(request)
         stream = RequestStream(request_id=request.request_id)
         self.ledger.record_request(request)
         task = asyncio.create_task(self._execute(request, stream), name=f"hc-req-{request.request_id}")
@@ -364,6 +465,7 @@ class Orchestrator:
 
     async def stream(self, request: ChatRequest) -> AsyncIterator[StreamEvent]:
         """Run a request and yield its events as they happen."""
+        self._user_activity(request)
         stream = RequestStream(request_id=request.request_id)
         self.ledger.record_request(request)
         task = asyncio.create_task(self._execute(request, stream), name=f"hc-stream-{request.request_id}")
@@ -374,6 +476,84 @@ class Orchestrator:
         finally:
             if task.done():
                 _consume_task_result(task)
+
+    # ------------------------------------------------------------------ #
+    # The user always wins
+    # ------------------------------------------------------------------ #
+    def _user_activity(self, request: ChatRequest) -> None:
+        """Called for every incoming request.
+
+        Two things happen here, both on the hot path and both cheap:
+
+        * the sleep-time engine is **preempted** -- the training stops at its
+          next checkpoint and the workers come back to the user;
+        * the conversation is **remembered** -- the durable facts are
+          distilled into the memory and the retrieval context for this
+          request is attached to it.
+        """
+        if self.autopilot is not None:
+            self.autopilot.notify_activity("user request")
+        if self.memory is None:
+            return
+        try:
+            self.memory.distill_facts(request.messages, metadata={"request_id": request.request_id})
+        except Exception:  # noqa: BLE001 - the memory must never break a request
+            LOGGER.warning("memory distillation failed", extra={"hc_request": request.request_id})
+
+    def _memory_context(self, request: ChatRequest) -> str:
+        """The retrieval context for a request (empty when there is none)."""
+        if self.memory is None or not self.settings.memory_enabled:
+            return ""
+        question = ""
+        for message in reversed(request.messages):
+            if message.role == "user":
+                question = message.content
+                break
+        if not question:
+            return ""
+        try:
+            return self.memory.context(
+                question,
+                k=self.settings.memory_context_top_k,
+                max_chars=self.settings.memory_context_chars,
+            )
+        except Exception:  # noqa: BLE001
+            LOGGER.warning("memory retrieval failed", extra={"hc_request": request.request_id})
+            return ""
+
+    def _with_memory(self, request: ChatRequest) -> ChatRequest:
+        """Attach the retrieved memory to the request (as a system message)."""
+        context = self._memory_context(request)
+        if not context:
+            return request
+        messages = list(request.messages)
+        system = next((message for message in messages if message.role == "system"), None)
+        if system is not None:
+            system = system.model_copy(update={"content": f"{system.content}\n\n{context}"})
+            messages = [system if message is system else message for message in messages]
+        else:
+            messages.insert(0, ChatMessage(role="system", content=context))
+        return request.model_copy(update={"messages": messages})
+
+    def _remember(self, request: ChatRequest, completion: ChatCompletion) -> None:
+        """Store the exchange in the memory (the cluster learns from it)."""
+        if self.memory is None or not completion.text:
+            return
+        question = ""
+        for message in reversed(request.messages):
+            if message.role == "user":
+                question = message.content
+                break
+        if not question:
+            return
+        try:
+            self.memory.record_exchange(
+                question,
+                completion.text,
+                metadata={"request_id": request.request_id, "mode": request.mode.value},
+            )
+        except Exception:  # noqa: BLE001
+            LOGGER.warning("memory write failed", extra={"hc_request": request.request_id})
 
     # ------------------------------------------------------------------ #
     # Execution
@@ -421,6 +601,7 @@ class Orchestrator:
                 return completion
             else:
                 self.ledger.complete(completion)
+                self._remember(request, completion)
                 if stream is not None:
                     await stream.emit("done", completion.model_dump(mode="json"))
                     stream.resolve(completion)
@@ -431,6 +612,7 @@ class Orchestrator:
         mode = self.scheduler.classify(request)
         request.mode = mode
         self.selector.record_demand(mode)
+        request = self._with_memory(request)
         self._inflight += 1
         try:
             if stream is not None:

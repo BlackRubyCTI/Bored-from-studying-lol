@@ -23,6 +23,7 @@ import httpx
 
 from core.config import Settings
 from core.errors import WorkerUnreachableError
+from core.http_client import LoopBoundClient
 from core.logging_setup import get_logger
 from core.protocol import (
     ChatCompletion,
@@ -78,15 +79,21 @@ class WorkerClient:
     def __init__(self, settings: Settings, *, client: httpx.AsyncClient | None = None) -> None:
         self.settings = settings
         self._owns_client = client is None
-        self._client = client or httpx.AsyncClient(
+        self._http = LoopBoundClient(
+            client,
             timeout=httpx.Timeout(connect=5.0, read=settings.request_timeout_seconds, write=10.0, pool=10.0),
             limits=httpx.Limits(max_connections=256, max_keepalive_connections=64),
             headers={"user-agent": "hyper-cluster-head/1.0"},
         )
 
+    @property
+    def _client(self) -> httpx.AsyncClient:
+        """The client of the loop that is running right now."""
+        return self._http.bind()
+
     async def aclose(self) -> None:
         if self._owns_client:
-            await self._client.aclose()
+            await self._http.aclose()
 
     # ------------------------------------------------------------------ #
     def _url(self, record: WorkerRecord, path: str) -> str:
@@ -215,6 +222,51 @@ class WorkerClient:
             raise WorkerUnreachableError(
                 f"worker {record.worker_id} failed to load {spec.name}: {exc}",
                 details={"worker_id": record.worker_id, "model": spec.name},
+            ) from exc
+
+    async def load_brain(self, record: WorkerRecord, artifact: str) -> bool:
+        """Hot-reload the trained brain on a worker.
+
+        ``artifact`` is the base64 encoded LoRA artifact produced by the
+        sleep-time engine.  Returns ``True`` when the worker accepted it.
+        """
+        try:
+            response = await self._client.post(
+                self._url(record, "/v1/brain/load"),
+                json={"worker_id": record.worker_id, "artifact": artifact},
+                headers=self._headers(record),
+                timeout=httpx.Timeout(120.0, connect=5.0),
+            )
+            if response.status_code >= 400:
+                LOGGER.warning(
+                    "worker refused the brain",
+                    extra={"hc_worker": record.worker_id, "hc_status": response.status_code},
+                )
+                return False
+            return bool(response.json().get("ok"))
+        except httpx.HTTPError as exc:
+            LOGGER.warning(
+                "brain hot-reload failed",
+                extra={"hc_worker": record.worker_id, "hc_error": str(exc)},
+            )
+            return False
+
+    async def train_shard(self, record: WorkerRecord, payload: dict[str, Any]) -> tuple[Any, float]:
+        """Ask a worker for the gradient of one data shard."""
+        try:
+            response = await self._client.post(
+                self._url(record, "/v1/train/shard"),
+                json=payload,
+                headers=self._headers(record),
+                timeout=httpx.Timeout(120.0, connect=5.0),
+            )
+            response.raise_for_status()
+            body = response.json()
+            return body.get("gradient"), float(body.get("loss") or 0.0)
+        except (httpx.HTTPError, json.JSONDecodeError) as exc:
+            raise WorkerUnreachableError(
+                f"worker {record.worker_id} failed to compute the shard gradient: {exc}",
+                details={"worker_id": record.worker_id},
             ) from exc
 
     async def drain(self, record: WorkerRecord) -> bool:

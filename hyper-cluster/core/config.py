@@ -238,20 +238,57 @@ class Settings:
     spawner_default_ttl_seconds: int = 3600
     spawner_max_parallel_provisions: int = 2
 
+    # --- persistent memory (milestone 4) ------------------------------------
+    memory_enabled: bool = True
+    memory_dir: str = ""
+    memory_chunk_size: int = 800
+    memory_chunk_overlap: int = 120
+    memory_max_chunks: int = 20000
+    memory_context_chars: int = 2400
+    memory_context_top_k: int = 4
+
+    # --- sleep-time self-evolution (milestone 4) -----------------------------
+    #: The cluster learns while it is idle.
+    evolution_enabled: bool = False
+    #: How long the cluster must be quiet before it starts training.
+    evolution_idle_seconds: int = 300
+    #: The budget a user request has to preempt the training.
+    evolution_preempt_budget_seconds: float = 2.0
+    #: How many synthetic examples one cycle trains on.
+    evolution_dataset_size: int = 16
+    #: How hard the synthetic prompts are (0..1).
+    evolution_difficulty: float = 0.8
+    #: How many workers draft one prompt.
+    evolution_drafts_per_prompt: int = 2
+    #: The maximum number of training shards (one per worker).
+    evolution_max_shards: int = 4
+    #: Whether the system prompt is evolved as well.
+    evolution_prompt_enabled: bool = True
+    #: The training hyper-parameters.
+    evolution_train_steps: int = 8
+    evolution_train_learning_rate: float = 0.5
+    evolution_train_rank: int = 8
+    evolution_train_dim: int = 128
+    evolution_train_vocab: int = 128
+    evolution_checkpoint_dir: str = ""
+
+    # --- cloud sync (milestone 4) -------------------------------------------
+    #: The token of the Google Drive service account / OAuth client.
+    drive_token: str = ""
+    drive_api_base: str = "https://www.googleapis.com/drive/v3"
+    drive_upload_base: str = "https://www.googleapis.com/upload/drive/v3"
+    drive_folder: str = "Hyper-Cluster Memory"
+    #: The Hugging Face Hub token and repository.
+    hub_token: str = ""
+    hub_base_url: str = "https://huggingface.co"
+    hub_repo: str = ""
+    sync_enabled: bool = False
+
     # --- External providers -------------------------------------------------
     edge_timeout_seconds: float = 30.0
     edge_max_retries: int = 2
     credential_file: str = ""
     provider_probe_interval_seconds: int = 300
-
-    # --- Memory / evolution (activated in later milestones) -----------------
-    memory_enabled: bool = True
-    vector_store_path: str = ""
-    memory_sync_drive_folder: str = ""
-    memory_sync_hf_repo: str = ""
-    evolution_enabled: bool = True
-    evolution_idle_seconds: int = 300
-    evolution_preempt_budget_ms: int = 2000
 
     # --- Observability ------------------------------------------------------
     log_level: str = "INFO"
@@ -271,8 +308,10 @@ class Settings:
             self.logs_dir = str(Path(self.data_dir) / "logs")
         if not self.credential_file:
             self.credential_file = str(Path(self.data_dir) / "credentials.json")
-        if not self.vector_store_path:
-            self.vector_store_path = str(Path(self.data_dir) / "memory")
+        if not self.memory_dir:
+            self.memory_dir = str(Path(self.data_dir) / "memory")
+        if not self.evolution_checkpoint_dir:
+            self.evolution_checkpoint_dir = str(Path(self.data_dir) / "checkpoints")
 
     # ------------------------------------------------------------------ #
     @property
@@ -369,19 +408,49 @@ class Settings:
             spawner_max_parallel_provisions=_as_int(
                 pick("spawner_max_parallel_provisions"), defaults.spawner_max_parallel_provisions
             ),
+            memory_enabled=_as_bool(pick("memory_enabled"), defaults.memory_enabled),
+            memory_dir=pick("memory_dir", "") or "",
+            memory_chunk_size=_as_int(pick("memory_chunk_size"), defaults.memory_chunk_size),
+            memory_chunk_overlap=_as_int(pick("memory_chunk_overlap"), defaults.memory_chunk_overlap),
+            memory_max_chunks=_as_int(pick("memory_max_chunks"), defaults.memory_max_chunks),
+            memory_context_chars=_as_int(pick("memory_context_chars"), defaults.memory_context_chars),
+            memory_context_top_k=_as_int(pick("memory_context_top_k"), defaults.memory_context_top_k),
+            evolution_enabled=_as_bool(pick("evolution_enabled"), defaults.evolution_enabled),
+            evolution_idle_seconds=_as_int(pick("evolution_idle_seconds"), defaults.evolution_idle_seconds),
+            evolution_preempt_budget_seconds=_as_float(
+                pick("evolution_preempt_budget_seconds"), defaults.evolution_preempt_budget_seconds
+            ),
+            evolution_dataset_size=_as_int(pick("evolution_dataset_size"), defaults.evolution_dataset_size),
+            evolution_difficulty=_as_float(pick("evolution_difficulty"), defaults.evolution_difficulty),
+            evolution_drafts_per_prompt=_as_int(
+                pick("evolution_drafts_per_prompt"), defaults.evolution_drafts_per_prompt
+            ),
+            evolution_max_shards=_as_int(pick("evolution_max_shards"), defaults.evolution_max_shards),
+            evolution_prompt_enabled=_as_bool(
+                pick("evolution_prompt_enabled"), defaults.evolution_prompt_enabled
+            ),
+            evolution_train_steps=_as_int(pick("evolution_train_steps"), defaults.evolution_train_steps),
+            evolution_train_learning_rate=_as_float(
+                pick("evolution_train_learning_rate"), defaults.evolution_train_learning_rate
+            ),
+            evolution_train_rank=_as_int(pick("evolution_train_rank"), defaults.evolution_train_rank),
+            evolution_train_dim=_as_int(pick("evolution_train_dim"), defaults.evolution_train_dim),
+            evolution_train_vocab=_as_int(pick("evolution_train_vocab"), defaults.evolution_train_vocab),
+            evolution_checkpoint_dir=pick("evolution_checkpoint_dir", "") or "",
+            drive_token=pick("drive_token", "") or "",
+            drive_api_base=pick("drive_api_base", defaults.drive_api_base),
+            drive_upload_base=pick("drive_upload_base", defaults.drive_upload_base),
+            drive_folder=pick("drive_folder", defaults.drive_folder),
+            hub_token=pick("hub_token", "") or "",
+            hub_base_url=pick("hub_base_url", defaults.hub_base_url),
+            hub_repo=pick("hub_repo", "") or "",
+            sync_enabled=_as_bool(pick("sync_enabled"), defaults.sync_enabled),
             edge_timeout_seconds=_as_float(pick("edge_timeout_seconds"), defaults.edge_timeout_seconds),
             edge_max_retries=_as_int(pick("edge_max_retries"), defaults.edge_max_retries),
             credential_file=pick("credential_file", "") or "",
             provider_probe_interval_seconds=_as_int(
                 pick("provider_probe_interval_seconds"), defaults.provider_probe_interval_seconds
             ),
-            memory_enabled=_as_bool(pick("memory_enabled"), defaults.memory_enabled),
-            vector_store_path=pick("vector_store_path", "") or "",
-            memory_sync_drive_folder=pick("memory_sync_drive_folder", "") or "",
-            memory_sync_hf_repo=pick("memory_sync_hf_repo", "") or "",
-            evolution_enabled=_as_bool(pick("evolution_enabled"), defaults.evolution_enabled),
-            evolution_idle_seconds=_as_int(pick("evolution_idle_seconds"), defaults.evolution_idle_seconds),
-            evolution_preempt_budget_ms=_as_int(pick("evolution_preempt_budget_ms"), defaults.evolution_preempt_budget_ms),
             log_level=raw_log_level,
             log_json=_as_bool(pick("log_json"), defaults.log_json),
             log_file=pick("log_file", "") or "",

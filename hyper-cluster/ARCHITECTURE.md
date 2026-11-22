@@ -75,7 +75,7 @@
 | **1 — Control plane & resilient orchestrator** | `core/*`, `head_node/{app,serve,orchestrator,scheduler,worker_registry,hold_queue,request_store,worker_client,edge_bridge,council,events}.py` | ✅ **complete** |
 | **2 — Self-benchmarking worker, mesh & tool sandbox** | `worker/{bootstrap.sh,worker_agent.py,telemetry.py,inference_engine.py,mesh.py}`, `tools/sandbox.py`, Tailscale mesh | ✅ **complete** |
 | **3 — Headless API compute spawner & VRAM auto-scaler** | `head_node/{auto_spawner.py,model_selector.py}` | ✅ **complete** |
-| 4 — Infinite memory & sleep-time self-evolution | `memory/vector_memory.py`, `training/{autopilot_evolver,self_play,synthetic_data,prompt_evolver,distributed_trainer,checkpoint_streamer}.py` | ⏳ |
+| **4 — Infinite memory & sleep-time self-evolution** | `memory/{vector_memory,sync}.py`, `training/{autopilot_evolver,self_play,synthetic_data,prompt_evolver,distributed_trainer,checkpoint_streamer,qlora}.py`, `worker/brain.py` | ✅ **complete** |
 | 5 — Mobile PWA mission control, phone alerts, one-command installer | `mobile/{dashboard.py,cli.py,notifier.py}`, `install_all.sh` | ⏳ |
 
 ---
@@ -396,19 +396,87 @@ no small node.
 
 ---
 
-## 6. Planned architecture (Milestones 4–5)
+## 6. Milestone 4 — memory + self-evolution (implemented)
 
-### Milestone 4 — memory + self-evolution
-* `memory/vector_memory.py` — FAISS/Chroma index synced to Google Drive + Hugging Face Hub.
-* `training/autopilot_evolver.py` — after 5 idle minutes the cluster trains; any incoming message
-  preempts it within the 2 s budget.
-* `training/self_play.py` / `synthetic_data.py` — mine chats, generate hard prompts, draft with
-  many workers, keep only critic-verified traces.
-* `training/distributed_trainer.py` / `checkpoint_streamer.py` — checkpointed QLoRA, auto-merge,
-  push to Drive/HF, hot-reload the upgraded brain.
-* `training/prompt_evolver.py` — mutate, benchmark and promote system prompts.
+### 6.1 The memory
 
-### Milestone 5 — mission control
+```
+memory/
+├── vector_memory.py   the store: chunks, hybrid retrieval, facts, snapshots
+└── sync.py            the cloud: Drive + Hub clients, resumable uploads, checksums
+```
+
+* **Chunking & indexing** — a document is split into overlapping chunks; every chunk gets a
+  deterministic hashed embedding (`dim` configurable) *and* a keyword vector, so the retrieval
+  works without a GPU and without a model download.
+* **Hybrid retrieval** — the score is `0.6 × cosine + 0.4 × keyword overlap`; a fact always
+  outranks the raw conversation it came from (`importance`).
+* **Durable facts** — the conversations are distilled into short statements
+  (`my name is Ada`, `stack: kubernetes with three node pools`). The distiller stops at the first
+  conjunction, so one sentence never becomes two facts.
+* **Persistence** — the store is written atomically (temp file + rename) after every mutation and
+  reloaded on boot; the revision counter tells the caller whether anything changed.
+* **Snapshots** — a portable JSON document with a SHA-256 of its content; `restore()` refuses a
+  snapshot whose checksum does not match.
+* **The cloud** — `MemorySync` pushes the snapshot to Drive (resumable session upload) and to the
+  Hugging Face Hub (pre-signed upload + commit), stores the checksum in the Drive
+  `appProperties`, and pulls the newest snapshot back. A corrupted download is rejected, never
+  restored.
+
+### 6.2 The sleep-time engine
+
+```
+idle ──▶ mine ──▶ synthesise ──▶ self-play ──▶ prompt ──▶ train ──▶ merge ──▶ push ──▶ hot-reload
+```
+
+| Stage | Module | What it does |
+|---|---|---|
+| idle | `training/autopilot_evolver.py` | waits for `evolution_idle_seconds` of silence, then starts a cycle |
+| mine | `training/synthetic_data.py` | the conversations are mined into question/answer seeds |
+| synthesise | `training/synthetic_data.py` | the seeds are mutated (audience, domain, format, risk, counterfactual) into harder prompts — deterministic for a fixed seed |
+| self-play | `training/self_play.py` | the prompts are drafted by several workers, the critic scores them, only the verified traces survive |
+| prompt | `training/prompt_evolver.py` | the system prompt is mutated, benchmarked on held-out questions and promoted **only** on a real gain |
+| train | `training/distributed_trainer.py` | federated QLoRA: the dataset is split into shards, every shard is computed by a worker, the gradients are averaged by shard weight |
+| merge | `training/qlora.py` | the dense update is factorised (truncated SVD) into a rank-`r` LoRA pair, int8-quantised and merged into the base matrix (`B @ A`) |
+| push | `training/checkpoint_streamer.py` | the checkpoint (matrix + metadata) goes to Drive and the Hub, SHA-256 verified |
+| hot-reload | `worker/brain.py` | the new artifact is decoded and validated *before* it replaces the running brain — a broken artifact never takes a worker down |
+
+Every step writes a checkpoint, so an interrupted (or preempted) run resumes where it stopped.
+
+### 6.3 The preemption contract
+
+> A chat that arrives during the training must be served in **less than two seconds**.
+
+The contract is enforced by a single synchronous flip on the request path:
+
+1. `Orchestrator._user_activity()` runs on **every** incoming request (before any routing).
+2. It calls `AutopilotEvolver.notify_activity()`, which flips the `PreemptionToken`
+   (an `asyncio.Event`) and resets the idle timer. Both are O(1) — no lock, no I/O.
+3. Every stage of the pipeline checks the token: the self-play between prompts, the trainer
+   between steps *and* between shards.
+4. The in-flight shard call is **raced against the token** (`asyncio.wait`), so a slow worker
+   cannot hold the user hostage: the call is cancelled the moment the token flips.
+5. The token records `requested_at` and `acknowledged_at`; the difference is the measured
+   preemption latency, which is exposed on `/v1/evolution/status` and asserted by the tests.
+
+Measured in the live smoke test: **~50 ms** (budget: 2000 ms).
+
+The training never claims worker capacity, so a preempted run cannot leave a worker busy.
+
+### 6.4 New control-plane routes
+
+| Route | Purpose |
+|---|---|
+| `GET /v1/memory` | the state of the memory (chunks, documents, revision) |
+| `GET /v1/memory/documents` | the indexed documents |
+| `POST /v1/memory/documents` | upload a file — it is indexed immediately |
+| `POST /v1/memory/search` | hybrid retrieval over the memory |
+| `POST /v1/memory/sync` | push the snapshot to Drive / the Hub, or pull it back |
+| `GET /v1/evolution/status` | the state of the engine, the phase, the preemption latency |
+| `POST /v1/evolution/run` | run one self-evolution cycle now |
+| `POST /v1/evolution/prompt` | set the system prompt of the cluster |
+
+### 6.5 Milestone 5 — mission control
 * `mobile/dashboard.py` — dark-mode, touch-first PWA (streaming chat, voice in/out, drag-and-drop
   RAG upload, council toggle, autopilot switch, live GPU/VRAM/tok-s telemetry).
 * `mobile/notifier.py` — Telegram/webhook push when a better model ships or a key needs attention.
@@ -422,20 +490,30 @@ no small node.
 ```
 hyper-cluster/
 ├── core/                    shared foundation
-├── head_node/               control plane  (M1 ✅, M3 ✅)
-├── worker/                  mesh worker    (M2 ✅)
+├── head_node/               control plane  (M1 ✅, M3 ✅, M4 ✅)
+├── worker/                  mesh worker    (M2 ✅, M4 ✅)
 │   ├── worker_agent.py      runtime + HTTP API + CLI
 │   ├── inference_engine.py  llama.cpp / upstream / simulator
 │   ├── telemetry.py         self-benchmarking
 │   ├── mesh.py              Tailscale automation
+│   ├── brain.py             the hot-reloadable LoRA brain
 │   └── bootstrap.sh         zero-touch provisioning
 ├── tools/                   tool-use sandbox (M2 ✅)
 │   └── sandbox.py           python isolation, web, files, tool protocol
-├── memory/                  vector memory   (M4 ⏳)
-├── training/                self-evolution  (M4 ⏳)
+├── memory/                  vector memory   (M4 ✅)
+│   ├── vector_memory.py     store, hybrid retrieval, facts, snapshots
+│   └── sync.py              Drive + Hub sync, resumable uploads, checksums
+├── training/                self-evolution  (M4 ✅)
+│   ├── autopilot_evolver.py the idle watchdog + the preemption contract
+│   ├── synthetic_data.py    mining + deterministic mutations
+│   ├── self_play.py         fan-out drafting + critic scoring
+│   ├── distributed_trainer.py federated, checkpointed, preemptible
+│   ├── qlora.py             the maths (ridge, int8, SVD, merge)
+│   ├── checkpoint_streamer.py push/pull the training state
+│   └── prompt_evolver.py    mutate, benchmark, promote
 ├── mobile/                  PWA + notifier  (M5 ⏳)
-├── tests/                   live test-suite (181 tests, real HTTP + SSE)
-├── scripts/                 smoke harnesses (M1 + M2 + M3)
+├── tests/                   live test-suite (232 tests, real HTTP + SSE)
+├── scripts/                 smoke harnesses (M1 + M2 + M3 + M4)
 ├── .env.example             configuration template
 ├── ARCHITECTURE.md          this document
 └── pyproject.toml
