@@ -46,6 +46,7 @@ from head_node.events import EventBus
 from head_node.orchestrator import Orchestrator
 from head_node.request_store import RequestLedger
 from head_node.worker_registry import WorkerRegistry
+from tools.sandbox import PythonSandbox, ToolExecutor
 
 LOGGER = get_logger("head_node.app")
 
@@ -77,11 +78,18 @@ def create_app(
     )
     events = EventBus()
     ledger = RequestLedger()
+    tools = ToolExecutor(
+        sandbox=PythonSandbox(
+            timeout=resolved.sandbox_timeout_seconds,
+            memory_limit_mb=resolved.sandbox_memory_limit_mb,
+        ),
+    ) if resolved.sandbox_enabled else None
     engine = orchestrator or Orchestrator(
         resolved,
         registry=registry,
         events=events,
         ledger=ledger,
+        tools=tools,
     )
 
     @asynccontextmanager
@@ -266,6 +274,19 @@ def create_app(
         engine._capacity_event.set()  # noqa: SLF001 - internal wake-up for held requests
         return {"ok": True, "expires_at": record.expires_at, "seconds_to_expiry": record.seconds_to_expiry}
 
+    @app.post("/v1/workers/{worker_id}/events")
+    async def worker_event(
+        worker_id: str,
+        payload: dict[str, Any],
+        _: str = Depends(require_mesh_auth),
+    ) -> dict[str, Any]:
+        """Let a worker push a notification into the cluster event stream."""
+        event = str(payload.get("event") or "worker.event")
+        data = dict(payload.get("data") or {})
+        data.setdefault("worker_id", worker_id)
+        await engine.events.emit(event, data)
+        return {"ok": True}
+
     @app.post("/v1/workers/{worker_id}/drain")
     async def drain_worker(worker_id: str, _: str = Depends(require_admin_auth)) -> dict[str, Any]:
         record = engine.registry.drain(worker_id, reason="admin request")
@@ -338,6 +359,16 @@ def create_app(
             "active_model": engine.scheduler.active_model(),
             "models": [spec.model_dump(mode="json") for spec in catalog.models],
             "edge_models": catalog.edge_models,
+        }
+
+    @app.get("/v1/tools")
+    async def tools_catalogue(_: str = Depends(require_client_auth)) -> dict[str, Any]:
+        """The tool schemas the model can call."""
+        executor = engine.tools
+        return {
+            "enabled": executor is not None,
+            "tools": executor.list_tools() if executor is not None else [],
+            "max_rounds": resolved.max_tool_rounds,
         }
 
     @app.get("/v1/queue")

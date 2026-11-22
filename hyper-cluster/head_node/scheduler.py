@@ -216,7 +216,8 @@ class Scheduler:
         if request.mode is not RequestMode.AUTO:
             return request.mode
         if request.tools:
-            return RequestMode.DEEP
+            # The client explicitly offers tools -> the agentic loop.
+            return RequestMode.SANDBOX
         text = " ".join(m.content for m in request.messages[-3:]).lower().strip()
         if not text:
             return RequestMode.FAST

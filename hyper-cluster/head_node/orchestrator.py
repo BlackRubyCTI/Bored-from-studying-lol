@@ -38,6 +38,7 @@ from core.ids import mono_ms, now_s
 from core.logging_setup import get_logger, log_context
 from core.protocol import (
     ChatCompletion,
+    ChatMessage,
     ChatRequest,
     ChunkSource,
     ClusterStatus,
@@ -55,6 +56,7 @@ from head_node.request_store import RequestLedger
 from head_node.scheduler import Scheduler, SchedulerDecision
 from head_node.worker_client import WorkerClient
 from head_node.worker_registry import WorkerRecord, WorkerRegistry
+from tools.sandbox import ToolExecutor, build_tool_prompt, parse_tool_call
 
 LOGGER = get_logger("head_node.orchestrator")
 
@@ -121,6 +123,7 @@ class Orchestrator:
         events: EventBus | None = None,
         ledger: RequestLedger | None = None,
         vault: CredentialVault | None = None,
+        tools: ToolExecutor | None = None,
     ) -> None:
         self.settings = settings if settings is not None else Settings.from_env()
         # NOTE: every collaborator is resolved with an explicit ``is not None``
@@ -156,6 +159,7 @@ class Orchestrator:
         self.council = (
             council if council is not None else CouncilEngine(self.settings, self.registry, self.scheduler, self.client)
         )
+        self.tools = tools
         self._capacity_event = asyncio.Event()
         self._background: list[asyncio.Task[Any]] = []
         self._closing = False
@@ -350,6 +354,8 @@ class Orchestrator:
                 )
             if mode is RequestMode.COUNCIL:
                 return await self._run_council(request, stream)
+            if mode is RequestMode.SANDBOX and self.tools is not None and self.settings.sandbox_enabled:
+                return await self._run_sandbox(request, stream)
             if mode is RequestMode.FAST and self.settings.speculative_enabled:
                 return await self._run_speculative(request, stream)
             return await self._execute_cluster(request, stream)
@@ -363,6 +369,7 @@ class Orchestrator:
         stream: RequestStream | None,
         *,
         emit_tokens: bool = True,
+        sync: bool = False,
     ) -> ChatCompletion:
         """Serve a request from the pooled GPU workers, with failover."""
         mode = self.scheduler.classify(request)
@@ -409,7 +416,10 @@ class Orchestrator:
             if decision.requires_model_load:
                 await self._ensure_model(record, decision.target_model)
             try:
-                completion = await self._run_on_worker(record, request, stream, emit_tokens=emit_tokens)
+                if sync:
+                    completion = await self._run_on_worker_sync(record, request)
+                else:
+                    completion = await self._run_on_worker(record, request, stream, emit_tokens=emit_tokens)
                 self._tokens_generated += completion.tokens
                 return completion
             except WorkerUnreachableError as exc:
@@ -468,6 +478,117 @@ class Orchestrator:
             {"worker_id": record.worker_id, "model": spec.name, "load_ms": result.load_ms},
         )
         return True
+
+    async def _run_on_worker_sync(
+        self, record: WorkerRecord, request: ChatRequest
+    ) -> ChatCompletion:
+        """Run a *blocking* completion on a worker (used by the tool loop)."""
+        started = mono_ms()
+        completion = await self.client.chat(record, request)
+        completion.worker_id = completion.worker_id or record.worker_id
+        completion.model = completion.model or record.model_loaded
+        completion.total_ms = completion.total_ms or (mono_ms() - started)
+        self.registry.record_latency(
+            record.worker_id,
+            ttft_ms=completion.ttft_ms,
+            total_ms=completion.total_ms,
+            tokens=completion.tokens,
+            tokens_per_sec=completion.tokens_per_sec,
+        )
+        return completion
+
+    async def _run_sandbox(
+        self, request: ChatRequest, stream: RequestStream | None
+    ) -> ChatCompletion:
+        """Agentic tool loop: the model calls tools, we execute them safely."""
+        assert self.tools is not None
+        schemas = self.tools.list_tools()
+        question = request.to_prompt()
+        system_prompt = build_tool_prompt(schemas, question)
+
+        messages: list[ChatMessage] = [ChatMessage(role="system", content=system_prompt)]
+        for message in request.messages:
+            if message.role == "system":
+                continue
+            messages.append(message)
+
+        transcript: list[dict[str, Any]] = []
+        final_text = ""
+        raw = ""
+        rounds = max(1, self.settings.max_tool_rounds)
+        started = mono_ms()
+
+        for round_index in range(rounds):
+            probe = ChatRequest(
+                request_id=f"{request.request_id}-tool-{round_index}",
+                messages=list(messages),
+                mode=RequestMode.DEEP,
+                max_tokens=min(request.max_tokens, 900),
+                temperature=request.temperature,
+                stream=False,
+            )
+            completion = await self._execute_cluster(probe, None, sync=True)
+            raw = completion.text or ""
+            call = parse_tool_call(raw)
+            if call is None:
+                final_text = raw.strip()
+                break
+            if "final" in call:
+                final_text = str(call.get("final") or "").strip()
+                break
+            tool_name = str(call.get("tool") or "")
+            # Tool execution is blocking (subprocess / network) -> keep the
+            # event loop free so other requests keep streaming.
+            result = await asyncio.to_thread(self.tools.execute_call, call)
+            transcript.append(
+                {
+                    "round": round_index,
+                    "tool": tool_name,
+                    "ok": result.ok,
+                    "output": result.output[:2000],
+                    "error": result.error,
+                    "duration_ms": round(result.duration_ms, 1),
+                }
+            )
+            if stream is not None:
+                await stream.emit(
+                    "tool",
+                    {
+                        "round": round_index,
+                        "tool": tool_name,
+                        "ok": result.ok,
+                        "output": result.output[:2000],
+                        "error": result.error,
+                    },
+                )
+            messages.append(ChatMessage(role="assistant", content=raw[:2000]))
+            messages.append(
+                ChatMessage(
+                    role="tool",
+                    content=f"[tool result: {tool_name}]\n{result.output[:4000]}",
+                )
+            )
+
+        if not final_text:
+            final_text = raw.strip()
+        if stream is not None and final_text:
+            for piece in _chunk_text(final_text):
+                await stream.emit("token", {"text": piece, "source": ChunkSource.SYNTHESIS.value, "draft": False})
+        return ChatCompletion(
+            request_id=request.request_id,
+            text=final_text,
+            model=None,
+            worker_id=None,
+            tier=WorkerTier.CLUSTER,
+            source=ChunkSource.SYNTHESIS,
+            mode=RequestMode.SANDBOX,
+            tokens=max(1, len(final_text) // 4),
+            total_ms=mono_ms() - started,
+            verified=True,
+            finish_reason="stop",
+            raw={"tools": transcript, "rounds": len(transcript)},
+            council=None,
+        )
 
     async def _run_on_worker(
         self,
@@ -830,6 +951,23 @@ class Orchestrator:
                     "model": record.model_loaded,
                 },
             )
+
+
+def _chunk_text(text: str, size: int = 48) -> list[str]:
+    """Split a final answer into word-aligned chunks for smooth streaming."""
+    words = text.split(" ")
+    chunks: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}" if current else word
+        if len(candidate) >= size and current:
+            chunks.append(current + " ")
+            current = word
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 def _drain_future(future: asyncio.Future[Any]) -> None:

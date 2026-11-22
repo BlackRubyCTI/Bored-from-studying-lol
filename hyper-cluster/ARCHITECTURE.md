@@ -73,7 +73,7 @@
 | Milestone | Deliverables | Status |
 |-----------|--------------|--------|
 | **1 — Control plane & resilient orchestrator** | `core/*`, `head_node/{app,serve,orchestrator,scheduler,worker_registry,hold_queue,request_store,worker_client,edge_bridge,council,events}.py` | ✅ **complete** |
-| 2 — Self-benchmarking worker, mesh & tool sandbox | `worker/{bootstrap.sh,worker_agent.py,telemetry.py,inference_engine.py}`, `tools/sandbox.py`, Tailscale mesh | ⏳ next |
+| **2 — Self-benchmarking worker, mesh & tool sandbox** | `worker/{bootstrap.sh,worker_agent.py,telemetry.py,inference_engine.py,mesh.py}`, `tools/sandbox.py`, Tailscale mesh | ✅ **complete** |
 | 3 — Headless API compute spawner & VRAM auto-scaler | `head_node/{auto_spawner.py,model_selector.py}` | ⏳ |
 | 4 — Infinite memory & sleep-time self-evolution | `memory/vector_memory.py`, `training/{autopilot_evolver,self_play,synthetic_data,prompt_evolver,distributed_trainer,checkpoint_streamer}.py` | ⏳ |
 | 5 — Mobile PWA mission control, phone alerts, one-command installer | `mobile/{dashboard.py,cli.py,notifier.py}`, `install_all.sh` | ⏳ |
@@ -221,17 +221,83 @@ something within a fraction of a second.
 
 ---
 
-## 4. Planned architecture (Milestones 2–5)
+## 4. Milestone 2 — worker + sandbox (implemented)
 
-### Milestone 2 — worker + sandbox
-* `worker/bootstrap.sh` — installs a **pre-compiled** CUDA `llama.cpp` (cached tarball, no build
-  on the node), fetches the GGUF, verifies the SHA-256, registers with the head node.
-* `worker/worker_agent.py` — the worker runtime: registration, heartbeat, SSE chat, model hot-load,
-  graceful drain.
-* `worker/telemetry.py` — benchmarks VRAM, FLOPS and mesh latency at join time and reports them.
-* `worker/inference_engine.py` — llama.cpp wrapper with prompt-cache reuse and speculative slots.
-* `tools/sandbox.py` — isolated Python execution (subprocess, no network, rlimits) + live web
-  fetch/scrape, so the model can verify its own maths before answering.
+### 4.1 Worker runtime
+
+```
+┌──────────────────────── worker node ────────────────────────┐
+│ bootstrap.sh                                                │
+│  ├─ platform detect (linux / darwin / termux / android)     │
+│  ├─ system deps (apt / dnf / apk / pkg)                     │
+│  ├─ venv + pinned requirements                              │
+│  ├─ pre-compiled llama.cpp  → ~/.hypercluster/cache (SHA)   │
+│  ├─ GGUF                  → ~/.hypercluster/models (SHA)    │
+│  ├─ systemd unit / Termux service (generated from env)      │
+│  └─ health probe + auto-restart                             │
+│                                                             │
+│ worker_agent.py                                             │
+│  ├─ load model → benchmark → register → heartbeat           │
+│  ├─ /v1/chat (sync)  /v1/chat/stream (SSE)  /v1/models     │
+│  ├─ /v1/telemetry  /v1/mesh  /health                        │
+│  ├─ hot-load a different GGUF without restarting             │
+│  └─ drain (stop new work, finish in flight, exit)           │
+│                                                             │
+│ telemetry.py                                                 │
+│  ├─ GPU: nvidia-smi → name, VRAM total/free, driver         │
+│  ├─ CPU/RAM: cores, load, available memory                  │
+│  ├─ FLOPS: real FP32 GEMM (torch CUDA, else numpy)         │
+│  ├─ latency: head-to-head RTT to the control plane          │
+│  ├─ decode: tokens/s measured on the running model          │
+│  └─ → core.protocol.Capabilities (measured, never guessed)  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+The backends are explicit and never mislabelled:
+
+| backend | what it is | reported as |
+|---|---|---|
+| `llama.cpp` | local GGUF through `llama-cpp-python` | `llama.cpp` |
+| `upstream` | any OpenAI-compatible HTTP endpoint | `upstream` |
+| `simulator` | deterministic generator for hosts without a GPU | `simulator` |
+
+Hot-loading builds the replacement backend *before* releasing the active one,
+so a failed load can never leave the worker without a model.
+
+### 4.2 Tailscale mesh
+
+* `tailscale up --authkey=… --advertise-tags=tag:hypercluster-worker`
+* `tailscale serve` (tailnet-only) and `tailscale funnel` (public) advertise the
+  worker's own port; `tailscale status --json` is parsed for peer discovery.
+* A tag-scoped ACL (`generate_acl`) keeps workers in their own lane: they may
+  reach the head node and their peers, never the internet.
+* Every call degrades gracefully: without the binary the mesh reports
+  `available=False` and the worker joins over the LAN instead.
+
+### 4.3 Tool sandbox
+
+```
+model ──{"tool":"python","args":{...}}──▶ head node
+                                             │
+                              ┌──────────────┴───────────────┐
+                              ▼                              ▼
+                    PythonSandbox (subprocess)        WebTools / FileAnalyzer
+                    ├ separate interpreter             ├ live HTTP fetch
+                    ├ rlimit CPU/AS/FSIZE/NPROC/NOFILE   ├ live search (DDG → Wikipedia)
+                    ├ socket + getaddrinfo guard        └ file stats, entropy, text
+                    └ subprocess / os.system guard
+                              │
+                    stdout / stderr / value ──▶ back into the conversation
+```
+
+The model answers with exactly one JSON object per round
+(`{"tool": …}` or `{"final": …}`); the head node executes it, appends the
+result and repeats until the model finalises or `HYPER_MAX_TOOL_ROUNDS` is
+reached. Tool activity is streamed to the client as a `tool` SSE event.
+
+---
+
+## 5. Planned architecture (Milestones 3–5)
 
 ### Milestone 3 — spawner + auto-scaler
 * `head_node/auto_spawner.py` — headless provisioning for Kaggle kernels, HF Spaces, GitHub Actions,
@@ -260,19 +326,25 @@ something within a fraction of a second.
 
 ---
 
-## 5. Repository layout
+## 6. Repository layout
 
 ```
 hyper-cluster/
 ├── core/                    shared foundation
 ├── head_node/               control plane  (M1 ✅, M3 ⏳)
-├── worker/                  mesh worker    (M2 ⏳)
-├── tools/                   tool-use sandbox (M2 ⏳)
+├── worker/                  mesh worker    (M2 ✅)
+│   ├── worker_agent.py      runtime + HTTP API + CLI
+│   ├── inference_engine.py  llama.cpp / upstream / simulator
+│   ├── telemetry.py         self-benchmarking
+│   ├── mesh.py              Tailscale automation
+│   └── bootstrap.sh         zero-touch provisioning
+├── tools/                   tool-use sandbox (M2 ✅)
+│   └── sandbox.py           python isolation, web, files, tool protocol
 ├── memory/                  vector memory   (M4 ⏳)
 ├── training/                self-evolution  (M4 ⏳)
 ├── mobile/                  PWA + notifier  (M5 ⏳)
-├── tests/                   live test-suite (70 tests, real HTTP + SSE)
-├── scripts/                 operational helpers
+├── tests/                   live test-suite (141 tests, real HTTP + SSE)
+├── scripts/                 smoke harnesses (M1 + M2)
 ├── .env.example             configuration template
 ├── ARCHITECTURE.md          this document
 └── pyproject.toml

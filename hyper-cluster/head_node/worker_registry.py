@@ -256,10 +256,22 @@ class WorkerRegistry:
 
     # ------------------------------------------------------------------ #
     def heartbeat(self, beat: WorkerHeartbeat) -> WorkerRecord | None:
-        """Apply a heartbeat; returns ``None`` for unknown workers."""
+        """Apply a heartbeat; returns ``None`` for unknown *or* dead workers.
+
+        A worker that was seen failing is **not** resurrected by a heartbeat:
+        it has to register again to start a new session.  Otherwise a
+        half-alive worker (its HTTP server gone but its process alive) could
+        silently re-enter the routing pool.
+        """
         with self._lock:
             record = self._workers.get(beat.worker_id)
             if record is None:
+                return None
+            if record.status is WorkerStatus.DEAD:
+                LOGGER.warning(
+                    "heartbeat from a dead worker; it must register again",
+                    extra={"hc_worker": beat.worker_id},
+                )
                 return None
             now = now_s()
             record.last_heartbeat = now
@@ -348,16 +360,22 @@ class WorkerRegistry:
             return record
 
     def mark_lost(self, worker_id: str, *, reason: str = "") -> WorkerRecord | None:
-        """Mark a worker as unreachable but keep it visible for diagnostics."""
+        """Mark a worker as unreachable but keep it visible for diagnostics.
+
+        A worker that failed to serve a request is considered dead straight
+        away: it is removed from the routing pool immediately (so no further
+        traffic is sent to it) while the record itself survives until its TTL
+        expires, which keeps the failure visible in the dashboard.
+        """
         with self._lock:
             record = self._workers.get(worker_id)
             if record is None:
                 return None
             record.consecutive_misses += 1
             record.metadata["lost_reason"] = reason
-            if record.consecutive_misses >= 2:
-                record.status = WorkerStatus.DEAD
-                record.inflight = 0
+            record.status = WorkerStatus.DEAD
+            record.inflight = 0
+            LOGGER.warning("worker marked lost", extra={"hc_worker": worker_id, "hc_reason": reason})
             return record
 
     # ------------------------------------------------------------------ #
@@ -414,12 +432,18 @@ class WorkerRegistry:
             return True
 
     def release(self, worker_id: str, count: int = 1) -> None:
-        """Return capacity to a worker."""
+        """Return capacity to a worker.
+
+        A worker that was marked dead keeps its DEAD status: releasing the
+        claim after a failure must never put it back into the routing pool.
+        """
         with self._lock:
             record = self._workers.get(worker_id)
             if record is None:
                 return
             record.inflight = max(0, record.inflight - count)
+            if record.status is WorkerStatus.DEAD:
+                return
             if record.inflight == 0 and not record.draining:
                 record.status = WorkerStatus.IDLE
 

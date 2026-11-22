@@ -213,6 +213,12 @@ class Settings:
     speculative_edge_providers: list[str] = field(default_factory=lambda: ["groq", "cerebras", "sambanova"])
     speculative_min_edge_tps: float = 40.0
 
+    # --- tool use -----------------------------------------------------------
+    sandbox_enabled: bool = True
+    max_tool_rounds: int = 4
+    sandbox_timeout_seconds: int = 20
+    sandbox_memory_limit_mb: int = 512
+
     # --- External providers -------------------------------------------------
     edge_timeout_seconds: float = 30.0
     edge_max_retries: int = 2
@@ -318,6 +324,10 @@ class Settings:
             speculative_enabled=_as_bool(pick("speculative_enabled"), defaults.speculative_enabled),
             speculative_edge_providers=_as_list(pick("speculative_edge_providers"), defaults.speculative_edge_providers),
             speculative_min_edge_tps=_as_float(pick("speculative_min_edge_tps"), defaults.speculative_min_edge_tps),
+            sandbox_enabled=_as_bool(pick("sandbox_enabled"), defaults.sandbox_enabled),
+            max_tool_rounds=_as_int(pick("max_tool_rounds"), defaults.max_tool_rounds),
+            sandbox_timeout_seconds=_as_int(pick("sandbox_timeout_seconds"), defaults.sandbox_timeout_seconds),
+            sandbox_memory_limit_mb=_as_int(pick("sandbox_memory_limit_mb"), defaults.sandbox_memory_limit_mb),
             edge_timeout_seconds=_as_float(pick("edge_timeout_seconds"), defaults.edge_timeout_seconds),
             edge_max_retries=_as_int(pick("edge_max_retries"), defaults.edge_max_retries),
             credential_file=pick("credential_file", "") or "",

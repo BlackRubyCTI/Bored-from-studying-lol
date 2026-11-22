@@ -2,17 +2,23 @@ PY ?= python3
 VENV ?= .venv
 BIN := $(VENV)/bin
 PORT ?= 8080
+WORKER_PORT ?= 8081
 
-.PHONY: help venv install check run test lint fmt clean smoke
+.PHONY: help venv install check run run-worker test lint fmt smoke smoke-m1 smoke-m2 worker-bootstrap worker-check clean
 
 help:
 	@echo "Hyper-Cluster Omega"
-	@echo "  make install   create the venv and install dependencies"
-	@echo "  make check     validate the configuration"
-	@echo "  make run       start the head node on :$(PORT)"
-	@echo "  make test      run the full test-suite"
-	@echo "  make smoke     start the node, probe it, stop it"
-	@echo "  make clean     remove caches"
+	@echo "  make install          create the venv and install dependencies"
+	@echo "  make check            validate the configuration"
+	@echo "  make run              start the head node on :$(PORT)"
+	@echo "  make run-worker       start a mesh worker on :$(WORKER_PORT)"
+	@echo "  make worker-check     validate the worker environment (no changes)"
+	@echo "  make worker-bootstrap provision a worker from scratch (zero-touch)"
+	@echo "  make test             run the full test-suite"
+	@echo "  make smoke            run the Milestone 1 smoke test"
+	@echo "  make smoke-m2         run the Milestone 2 smoke test"
+	@echo "  make lint             run ruff over the whole project"
+	@echo "  make clean            remove caches"
 
 venv:
 	$(PY) -m venv $(VENV)
@@ -27,17 +33,31 @@ check:
 run:
 	$(BIN)/python -m head_node.serve --host 0.0.0.0 --port $(PORT)
 
+run-worker:
+	$(BIN)/python -m worker.worker_agent
+
+worker-check:
+	bash worker/bootstrap.sh --check
+
+worker-bootstrap:
+	bash worker/bootstrap.sh --install
+
 test:
 	$(BIN)/python -m pytest tests/ -q
 
 lint:
-	$(BIN)/python -m ruff check core head_node tests || true
+	$(BIN)/python -m ruff check core head_node worker tools tests
 
 fmt:
-	$(BIN)/python -m ruff format core head_node tests || true
+	$(BIN)/python -m ruff format core head_node worker tools tests
 
-smoke:
+smoke: smoke-m1
+
+smoke-m1:
 	$(BIN)/python scripts/smoke_m1.py
+
+smoke-m2:
+	$(BIN)/python scripts/smoke_m2.py
 
 clean:
 	find . -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
