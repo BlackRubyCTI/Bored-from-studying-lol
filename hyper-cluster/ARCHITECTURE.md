@@ -74,7 +74,7 @@
 |-----------|--------------|--------|
 | **1 — Control plane & resilient orchestrator** | `core/*`, `head_node/{app,serve,orchestrator,scheduler,worker_registry,hold_queue,request_store,worker_client,edge_bridge,council,events}.py` | ✅ **complete** |
 | **2 — Self-benchmarking worker, mesh & tool sandbox** | `worker/{bootstrap.sh,worker_agent.py,telemetry.py,inference_engine.py,mesh.py}`, `tools/sandbox.py`, Tailscale mesh | ✅ **complete** |
-| 3 — Headless API compute spawner & VRAM auto-scaler | `head_node/{auto_spawner.py,model_selector.py}` | ⏳ |
+| **3 — Headless API compute spawner & VRAM auto-scaler** | `head_node/{auto_spawner.py,model_selector.py}` | ✅ **complete** |
 | 4 — Infinite memory & sleep-time self-evolution | `memory/vector_memory.py`, `training/{autopilot_evolver,self_play,synthetic_data,prompt_evolver,distributed_trainer,checkpoint_streamer}.py` | ⏳ |
 | 5 — Mobile PWA mission control, phone alerts, one-command installer | `mobile/{dashboard.py,cli.py,notifier.py}`, `install_all.sh` | ⏳ |
 
@@ -297,15 +297,106 @@ reached. Tool activity is streamed to the client as a `tool` SSE event.
 
 ---
 
-## 5. Planned architecture (Milestones 3–5)
+## 5. Milestone 3 — spawner + auto-scaler (implemented)
 
-### Milestone 3 — spawner + auto-scaler
-* `head_node/auto_spawner.py` — headless provisioning for Kaggle kernels, HF Spaces, GitHub Actions,
-  Lightning AI, Oracle ARM and Termux; multi-account credential vault; **10-minute pre-emptive
-  TTL rotator** that provisions a replacement before the current session dies and shifts traffic
-  after the replacement registers.
-* `head_node/model_selector.py` — sums live cluster VRAM, picks the highest-intelligence GGUF that
-  fits, hot-loads it, and pairs small fast nodes as speculative draft models.
+### 5.1 The headless compute spawner
+
+`head_node/auto_spawner.py` turns a credential into a running worker. Every provider is a
+`Provisioner` that speaks that provider's REST API headlessly — no browser, no manual click:
+
+| Provider | What the provisioner does |
+|---|---|
+| `kaggle` | creates a kernel, uploads the bootstrap payload, starts it, waits for the session deadline |
+| `hf_spaces` | creates a ZeroGPU Space, uploads the Dockerfile, starts it, reads the runtime stage |
+| `github_actions` | dispatches a reusable workflow (`workflow_dispatch`) with the head URL and mesh token |
+| `oracle` | boots an ARM/Ampere instance through the OCI API — the request is **signed** (RSA, `cryptography`) with the instance principal's key |
+| `edge_api` | registers a free API (Groq / Cerebras / SambaNova / OpenRouter) as a synthetic tier |
+
+Every provisioner returns a `SpawnResult` with the instance id, the endpoint, the account that
+paid for it and a redacted detail string. The **multi-account credential vault** picks the account:
+`core/credentials.py` holds one entry per account (`provider`, `label`, `token`, `metadata`), reads
+`HYPER_CRED_<PROVIDER>_<NAME>` plus `HYPER_CRED_<PROVIDER>_<NAME>_META` (JSON) from the
+environment, keeps the file at `0600`, and **fails over** to the next account when a provider
+rejects the current one (rate limit, expired key, quota).
+
+### 5.2 The pre-emptive TTL hot-swapper
+
+The liveness TTL is refreshed by every heartbeat, so it never *approaches* — it cannot be used to
+predict a death. The real deadline is the **session deadline**: a Kaggle kernel's runtime limit, a
+GitHub job's timeout, an instance's lifetime. The worker reports it in its registration metadata
+(`session_ends_at`), and the rotator acts when it comes within `HYPER_HANDOFF_LEAD_SECONDS`
+(default 600 s = 10 minutes):
+
+```
+session_ends_at ──(t-10 min)──▶ provision replacement ──▶ replacement registers ──▶ drain old ──▶ release
+        │                              │                            │                      │           │
+        └── the old worker keeps serving traffic the whole time ───┘                      └───────────┘
+```
+
+`AutoSpawner.tick()` performs three steps per pass:
+
+1. **rotate** — every worker whose session ends within the lead time gets a replacement provisioned
+   (a worker that went silent is treated the same way);
+2. **handoff** — as soon as a replacement registers, the old worker is drained and the traffic moves;
+3. **scale out** — if the pool drops below `HYPER_SPAWNER_MIN_WORKERS`, the spawner provisions the
+   missing nodes itself.
+
+Because the replacement is provisioned *before* the session dies, the hand-over is invisible to
+the client: `scripts/smoke_m3.py` keeps a request loop running during the whole procedure and
+records **zero failures**.
+
+### 5.3 The VRAM auto-scaler
+
+`head_node/model_selector.py` works on the *measured* VRAM of the live mesh, not on guesses:
+
+* **pooling** — every worker's advertised VRAM, the VRAM its resident model occupies (catalogue
+  estimate) and its free VRAM are summed; the pool exposes total / free / reserved / capacity,
+  per provider and per family;
+* **demand** — the orchestrator records every served request into a `DemandProfile`
+  (`fast` / `deep` / `council`), which yields the current demand level;
+* **target** — the level maps to a target model: the best GGUF that fits a healthy worker with the
+  safety factor applied (`autoscaler_safety_factor`), or a small-but-competent model for fast
+  traffic;
+* **plan** — a worker that hosts a *weaker* model than the target is upshifted, a worker that hosts
+  a *stronger* one is downshifted; `autoscaler_max_changes_per_tick` bounds the churn and
+  `autoscaler_min_dwell_seconds` keeps a node stable after a swap;
+* **apply** — the orchestrator hot-loads the model on the worker (`POST /v1/model/load`), updates
+  the registry and emits a `model.changed` event. A failed load leaves the previous model in place.
+
+**Honest throughput.** A worker that hot-swaps its model invalidates its last measurement. The
+registry therefore keeps the node's *hardware factor* (`tokens/s × B`, measured once in the
+benchmark) and re-derives the throughput for the model the node hosts now — so a 32B model on a
+node that measured 500 tok/s with a 0.5B model is correctly estimated as slower.
+
+### 5.4 Speculative draft / verifier pairing
+
+The selector pairs a small resident model (the **draft**) with a large one (the **verifier**) when
+the draft is at least 4× smaller *and* faster. The expected cost of speculative decoding is
+
+```
+E[t] = (1 - a)·t_target + a·(t_draft + e·t_target)      speed-up = t_target / E[t]
+```
+
+with an acceptance rate `a = 0.7` and a verification overhead `e = 0.1`. The orchestrator runs the
+draft on its own worker and verifies the tokens on the verifier worker (`ChunkSource.DRAFT` marks
+the speculative tokens in the SSE stream); the edge tier is used as the draft when the cluster has
+no small node.
+
+### 5.5 New control-plane routes
+
+| Route | Purpose |
+|---|---|
+| `GET /v1/cluster/vram` | the live VRAM pool and the demand profile |
+| `GET /v1/models/plan` | what the auto-scaler *would* do (no side effects) |
+| `POST /v1/cluster/autoscale` | compute the plan and execute it (hot-swap) |
+| `GET /v1/speculative/pair` | the current draft / verifier pair and its speed-up |
+| `GET /v1/spawner` | the spawner state: instances, accounts, pending hand-overs |
+| `POST /v1/spawner/provision` | provision one instance on demand |
+| `POST /v1/spawner/rotate` | rotate one worker now |
+
+---
+
+## 6. Planned architecture (Milestones 4–5)
 
 ### Milestone 4 — memory + self-evolution
 * `memory/vector_memory.py` — FAISS/Chroma index synced to Google Drive + Hugging Face Hub.
@@ -326,12 +417,12 @@ reached. Tool activity is streamed to the client as a `tool` SSE event.
 
 ---
 
-## 6. Repository layout
+## 7. Repository layout
 
 ```
 hyper-cluster/
 ├── core/                    shared foundation
-├── head_node/               control plane  (M1 ✅, M3 ⏳)
+├── head_node/               control plane  (M1 ✅, M3 ✅)
 ├── worker/                  mesh worker    (M2 ✅)
 │   ├── worker_agent.py      runtime + HTTP API + CLI
 │   ├── inference_engine.py  llama.cpp / upstream / simulator
@@ -343,8 +434,8 @@ hyper-cluster/
 ├── memory/                  vector memory   (M4 ⏳)
 ├── training/                self-evolution  (M4 ⏳)
 ├── mobile/                  PWA + notifier  (M5 ⏳)
-├── tests/                   live test-suite (141 tests, real HTTP + SSE)
-├── scripts/                 smoke harnesses (M1 + M2)
+├── tests/                   live test-suite (181 tests, real HTTP + SSE)
+├── scripts/                 smoke harnesses (M1 + M2 + M3)
 ├── .env.example             configuration template
 ├── ARCHITECTURE.md          this document
 └── pyproject.toml

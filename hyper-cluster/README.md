@@ -3,8 +3,9 @@
 **Zero-limit autonomous AI operating system.**
 A headless GPU compute pool, a sub-second inference path, and a phone-first mission control.
 
-> Milestones 1 and 2 of 5 are complete and verified:
-> **M1** — control plane & resilient orchestrator · **M2** — self-benchmarking worker, mesh & tool sandbox.
+> Milestones 1 to 3 of 5 are complete and verified:
+> **M1** — control plane & resilient orchestrator · **M2** — self-benchmarking worker, mesh & tool sandbox ·
+> **M3** — headless compute spawner, VRAM auto-scaler & speculative pairing.
 
 ---
 
@@ -37,6 +38,21 @@ A headless GPU compute pool, a sub-second inference path, and a phone-first miss
 | Live web search / fetch, file analysis, model-facing tool protocol | `tools/sandbox.py` |
 | Agentic tool loop wired into the orchestrator (tool events are streamed) | `head_node/orchestrator.py` |
 | 141 tests, including **real HTTP + SSE worker servers and live failover** | `tests/` |
+
+### Milestone 3 — headless compute spawner, VRAM auto-scaler & speculation
+
+| Capability | Where |
+|---|---|
+| Headless API provisioners: Kaggle kernels, HF Spaces, GitHub Actions, OCI Compute, edge APIs | `head_node/auto_spawner.py` |
+| Multi-account credential vault with provider defaults, per-account metadata and failover | `core/credentials.py` |
+| Live VRAM pooling across the whole worker mesh (measured, not guessed) | `head_node/model_selector.py` |
+| Demand-aware GGUF upshift / downshift with hysteresis and a safety factor | `head_node/model_selector.py` |
+| Speculative draft / verifier pairing with a cost model for the speed-up | `head_node/model_selector.py` |
+| Pre-emptive TTL hot-swapper: replacement is provisioned *before* the session dies | `head_node/auto_spawner.py` |
+| Worker session deadline reported in the registration metadata | `worker/worker_agent.py` |
+| Node hardware factor (`tokens/s × B`) so a hot-swap keeps the throughput estimate honest | `head_node/worker_registry.py` |
+| Seven new control-plane routes (`/v1/cluster/vram`, `/v1/models/plan`, `/v1/cluster/autoscale`, `/v1/speculative/pair`, `/v1/spawner`, `/v1/spawner/provision`, `/v1/spawner/rotate`) | `head_node/app.py` |
+| 181 tests, including **live auto-scaling and zero-downtime hand-overs** | `tests/` |
 
 ---
 
@@ -132,6 +148,11 @@ Everything is environment driven (`HYPER_*` prefix for the control plane,
 | `HYPER_WORKER_MODEL_REPO` / `_FILE` / `_SHA256` | which GGUF the bootstrap fetches and verifies |
 | `HYPER_WORKER_BACKEND` | `auto`, `llama.cpp`, `upstream` or `simulator` |
 | `HYPER_WORKER_TAILSCALE_AUTH_KEY` / `_TAGS` | tailnet join credentials and ACL tags |
+| `HYPER_HANDOFF_LEAD_SECONDS` | how long before a session ends the replacement is provisioned |
+| `HYPER_AUTOSCALER_ENABLED` / `_SAFETY_FACTOR` / `_MIN_DWELL_SECONDS` | the VRAM auto-scaler and its anti-thrash timer |
+| `HYPER_SPAWNER_ENABLED` / `_PROVIDERS` / `_MIN_WORKERS` | the headless compute spawner and the provider order |
+| `HYPER_SPAWNER_DEFAULT_TTL_SECONDS` | session lifetime the provisioner asks the provider for |
+| `HYPER_CRED_KAGGLE_META` / `_HF_META` / `_GITHUB_META` / `_ORACLE_META` | per-account JSON metadata (owner, region, tenancy, compartment) |
 
 Provider keys (`GROQ_API_KEY`, `CEREBRAS_API_KEY`, …) can be exported directly or registered
 through `POST /v1/credentials`; the vault stores them with `0600` permissions and rotates
@@ -142,10 +163,11 @@ between accounts automatically.
 ## Verification
 
 ```bash
-make test        # 141 tests: live HTTP/SSE servers, failover, sandbox, mesh, bootstrap
-make lint        # ruff over core/head_node/worker/tools/tests
+make test        # 181 tests: live HTTP/SSE servers, failover, sandbox, mesh, bootstrap, auto-scaler
+make lint        # ruff over core/head_node/worker/tools/tests/scripts
 make smoke       # Milestone 1 smoke test (23 checks)
 make smoke-m2    # Milestone 2 smoke test (31 checks)
+make smoke-m3    # Milestone 3 smoke test (27 checks: hot-swap, scaling, zero-downtime hand-over)
 ```
 
 ---
@@ -154,7 +176,7 @@ make smoke-m2    # Milestone 2 smoke test (31 checks)
 
 1. ✅ **Control plane & resilient orchestrator**
 2. ✅ **Self-benchmarking worker, mesh & tool sandbox**
-3. ⏳ Headless API compute spawner & VRAM auto-scaler
+3. ✅ **Headless API compute spawner & VRAM auto-scaler**
 4. ⏳ Infinite memory & sleep-time self-evolution
 5. ⏳ Mobile PWA mission control, phone alerts & one-command installer
 

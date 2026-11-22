@@ -62,8 +62,8 @@ class ThreadedServer:
 class HeadServer(ThreadedServer):
     """The control plane, served over real HTTP."""
 
-    def __init__(self, settings: Settings) -> None:
-        super().__init__(create_app(settings), free_port())
+    def __init__(self, settings: Settings, orchestrator: Any | None = None) -> None:
+        super().__init__(create_app(settings, orchestrator=orchestrator), free_port())
 
 
 class WorkerHarness(ThreadedServer):
@@ -86,6 +86,7 @@ class WorkerHarness(ThreadedServer):
         device: str = "cuda",
         max_concurrency: int = 2,
         mesh_latency_ms: float = 5.0,
+        session_ends_in: float | None = None,
     ) -> None:
         self.config = WorkerConfig(
             worker_id=worker_id,
@@ -102,6 +103,7 @@ class WorkerHarness(ThreadedServer):
             context_size=4096,
             max_concurrency=max_concurrency,
             heartbeat_seconds=2,
+            session_ends_at=(time.time() + session_ends_in) if session_ends_in else 0.0,
         )
         self.engine = InferenceEngine(
             backend="simulator",
@@ -122,8 +124,32 @@ class WorkerHarness(ThreadedServer):
         self.mesh_latency_ms = mesh_latency_ms
 
     async def boot(self) -> None:
-        """Load the model, benchmark and register with the head node."""
+        """Load the model, benchmark and register with the head node.
+
+        The agent registers in the background, so this waits until the head
+        node actually knows the worker -- otherwise a test could assert on a
+        registration that has not happened yet.
+        """
         await self.agent.start()
+        await self.wait_registered()
+
+    async def wait_registered(self, timeout: float = 20.0) -> bool:
+        """Wait until the head node lists this worker."""
+        import httpx
+
+        deadline = time.time() + timeout
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            while time.time() < deadline:
+                try:
+                    response = await client.get(f"{self.config.head_url}/v1/workers")
+                    if response.status_code == 200:
+                        for worker in response.json()["workers"]:
+                            if worker["worker_id"] == self.agent.worker_id:
+                                return True
+                except httpx.HTTPError:
+                    pass
+                await asyncio.sleep(0.1)
+        return False
 
     async def shutdown(self) -> None:
         """Stop the agent."""

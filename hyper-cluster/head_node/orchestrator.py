@@ -48,10 +48,12 @@ from core.protocol import (
     StreamEvent,
     WorkerTier,
 )
+from head_node.auto_spawner import AutoSpawner
 from head_node.council import CouncilEngine, CouncilOutcome, similarity
 from head_node.edge_bridge import EdgeBridge
 from head_node.events import EventBus
 from head_node.hold_queue import HoldQueue
+from head_node.model_selector import ModelSelector, ScalingDecision
 from head_node.request_store import RequestLedger
 from head_node.scheduler import Scheduler, SchedulerDecision
 from head_node.worker_client import WorkerClient
@@ -124,6 +126,8 @@ class Orchestrator:
         ledger: RequestLedger | None = None,
         vault: CredentialVault | None = None,
         tools: ToolExecutor | None = None,
+        selector: ModelSelector | None = None,
+        spawner: AutoSpawner | None = None,
     ) -> None:
         self.settings = settings if settings is not None else Settings.from_env()
         # NOTE: every collaborator is resolved with an explicit ``is not None``
@@ -160,6 +164,16 @@ class Orchestrator:
             council if council is not None else CouncilEngine(self.settings, self.registry, self.scheduler, self.client)
         )
         self.tools = tools
+        self.selector = (
+            selector
+            if selector is not None
+            else ModelSelector(self.settings, self.registry, self.scheduler.catalog)
+        )
+        self.spawner = (
+            spawner
+            if spawner is not None
+            else AutoSpawner(self.settings, self.registry, vault=self.edge.vault)
+        )
         self._capacity_event = asyncio.Event()
         self._background: list[asyncio.Task[Any]] = []
         self._closing = False
@@ -177,6 +191,8 @@ class Orchestrator:
         self._closing = False
         self._background.append(asyncio.create_task(self._capacity_loop(), name="hc-capacity-loop"))
         self._background.append(asyncio.create_task(self._maintenance_loop(), name="hc-maintenance-loop"))
+        self._background.append(asyncio.create_task(self._autoscale_loop(), name="hc-autoscale-loop"))
+        self._background.append(asyncio.create_task(self._spawner_loop(), name="hc-spawner-loop"))
         LOGGER.info("orchestrator started", extra={"hc_workers": len(self.registry)})
 
     async def shutdown(self) -> None:
@@ -192,6 +208,7 @@ class Orchestrator:
         self._background.clear()
         await self.edge.aclose()
         await self.client.aclose()
+        await self.spawner.aclose()
         LOGGER.info("orchestrator stopped")
 
     async def _capacity_loop(self) -> None:
@@ -225,6 +242,80 @@ class Orchestrator:
                 raise
             except Exception:  # noqa: BLE001
                 LOGGER.exception("maintenance loop error")
+                await asyncio.sleep(3.0)
+
+    async def _autoscale_loop(self) -> None:
+        """Keep the models on the pool in line with the live demand."""
+        while not self._closing:
+            try:
+                await asyncio.sleep(max(2.0, float(self.settings.autoscaler_min_dwell_seconds) / 4.0))
+                if not self.settings.autoscaler_enabled:
+                    continue
+                await self.autoscale()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - the loop must never die
+                LOGGER.exception("autoscaler loop error")
+                await asyncio.sleep(3.0)
+
+    async def autoscale(self) -> list[ScalingDecision]:
+        """Compute and apply the current scaling plan.
+
+        The decision logic lives in :class:`ModelSelector`; this method is the
+        part that *executes* it: the worker is told to hot-swap its model and
+        the registry is updated so the scheduler sees the new resident model.
+        """
+        decisions = self.selector.plan()
+        applied: list[ScalingDecision] = []
+        for decision in decisions:
+            if not decision.changes_model or not decision.model:
+                continue
+            record = self.registry.get(decision.worker_id)
+            if record is None:
+                continue
+            spec = find_model(self.selector.catalog, decision.model)
+            if spec is None:
+                continue
+            loaded = await self._ensure_model(record, spec.name)
+            if loaded:
+                applied.append(decision)
+                self.selector.mark_applied(decision.worker_id)
+                await self.events.emit(
+                    EventType.MODEL_CHANGED,
+                    {
+                        "worker_id": decision.worker_id,
+                        "model": spec.name,
+                        "previous_model": decision.previous_model,
+                        "direction": decision.direction,
+                        "reason": decision.reason,
+                    },
+                )
+        return applied
+
+    async def _spawner_loop(self) -> None:
+        """Provision and rotate compute without human intervention."""
+        while not self._closing:
+            try:
+                await asyncio.sleep(max(2.0, float(self.settings.spawner_tick_seconds)))
+                if not self.settings.spawner_enabled:
+                    continue
+                actions = await self.spawner.tick()
+                for action in actions:
+                    await self.events.emit(
+                        EventType.CAPACITY,
+                        {
+                            "kind": action.kind,
+                            "worker_id": action.worker_id,
+                            "replacement": action.replacement,
+                            "provider": action.provider,
+                            "detail": action.detail,
+                            "ok": action.ok,
+                        },
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - the loop must never die
+                LOGGER.exception("spawner loop error")
                 await asyncio.sleep(3.0)
 
     async def _replay_deferred(self) -> None:
@@ -339,6 +430,7 @@ class Orchestrator:
         """Resolve the mode and route to the matching pipeline."""
         mode = self.scheduler.classify(request)
         request.mode = mode
+        self.selector.record_demand(mode)
         self._inflight += 1
         try:
             if stream is not None:
@@ -723,6 +815,11 @@ class Orchestrator:
         candidates = self.edge.candidates()
         choice = self.scheduler.select_edge(candidates, request, mode=request.mode)
         if choice is None:
+            # No free API is reachable: draft *inside* the cluster with a small
+            # resident model and verify with the big one.
+            local = await self._run_local_speculative(request, stream)
+            if local is not None:
+                return local
             LOGGER.info("no edge endpoint available; falling back to cluster-only")
             return await self._execute_cluster(request, stream)
 
@@ -855,6 +952,120 @@ class Orchestrator:
         )
 
     # ------------------------------------------------------------------ #
+    async def _run_local_speculative(
+        self, request: ChatRequest, stream: RequestStream | None
+    ) -> ChatCompletion | None:
+        """Draft inside the cluster: a small model first, the big model verifies.
+
+        The pairing is computed by the model selector from the *live* pool: a
+        draft model that is at least 4x smaller and measurably faster than the
+        verifier.  Returns ``None`` when no usable pair exists.
+        """
+        pair = self.selector.draft_pair()
+        if pair is None or not pair.draft_model or not pair.verifier_model:
+            return None
+        draft_record = self.registry.get(pair.draft_worker)
+        verifier_record = self.registry.get(pair.verifier_worker)
+        if draft_record is None or verifier_record is None:
+            return None
+        if not draft_record.healthy or not verifier_record.healthy:
+            return None
+
+        draft_parts: list[str] = []
+        draft_error: str | None = None
+
+        async def _draft() -> None:
+            nonlocal draft_error
+            try:
+                async for chunk in self.client.stream_chat(draft_record, request):
+                    draft_parts.append(chunk.text or "")
+                    if stream is not None:
+                        await stream.emit(
+                            "token",
+                            {"text": chunk.text or "", "source": ChunkSource.DRAFT.value, "draft": True},
+                        )
+            except Exception as exc:  # noqa: BLE001 - the draft is best effort
+                draft_error = str(exc)
+                LOGGER.warning(
+                    "cluster draft failed",
+                    extra={"hc_error": str(exc), "hc_worker": draft_record.worker_id},
+                )
+
+        draft_job = asyncio.create_task(_draft(), name="hc-local-draft")
+
+        verifier_completion: ChatCompletion | None = None
+        try:
+            verifier_completion = await asyncio.wait_for(
+                self._execute_cluster(request, None, emit_tokens=False),
+                timeout=VERIFICATION_BUDGET_SECONDS,
+            )
+        except Exception as exc:  # noqa: BLE001 - the verifier is best effort
+            LOGGER.info("cluster verifier unavailable", extra={"hc_error": str(exc)})
+            verifier_completion = None
+
+        try:
+            await asyncio.wait_for(asyncio.shield(draft_job), timeout=VERIFICATION_BUDGET_SECONDS)
+        except asyncio.TimeoutError:
+            draft_job.cancel()
+        except Exception:  # noqa: BLE001
+            pass
+
+        draft_text = "".join(draft_parts)
+        if stream is not None:
+            await stream.emit(
+                "edge",
+                {
+                    "provider": "cluster",
+                    "label": pair.draft_worker,
+                    "model": pair.draft_model,
+                    "chars": len(draft_text),
+                    "error": draft_error,
+                    "paired_with": pair.verifier_model,
+                },
+            )
+
+        if verifier_completion is not None and verifier_completion.text.strip():
+            score = similarity(draft_text, verifier_completion.text)
+            verified = score >= VERIFICATION_THRESHOLD
+            if stream is not None:
+                await stream.emit(
+                    "verify",
+                    {
+                        "verdict": "confirmed" if verified else "revised",
+                        "similarity": round(score, 3),
+                        "verified_by": verifier_completion.worker_id,
+                        "model": verifier_completion.model,
+                        "draft_model": pair.draft_model,
+                    },
+                )
+            verifier_completion.verified = True
+            verifier_completion.verified_by = verifier_completion.worker_id
+            verifier_completion.raw = {
+                "draft_worker": pair.draft_worker,
+                "draft_model": pair.draft_model,
+                "verifier_model": pair.verifier_model,
+                "similarity": round(score, 3),
+                "draft_chars": len(draft_text),
+                "estimated_speedup": pair.estimated_speedup,
+            }
+            return verifier_completion
+
+        if not draft_text.strip():
+            return None
+        return ChatCompletion(
+            request_id=request.request_id,
+            text=draft_text,
+            model=pair.draft_model,
+            worker_id=pair.draft_worker,
+            tier=WorkerTier.CLUSTER,
+            source=ChunkSource.DRAFT,
+            mode=request.mode,
+            tokens=max(1, len(draft_text) // 4),
+            verified=False,
+            finish_reason="stop",
+            raw={"draft_worker": pair.draft_worker, "error": draft_error},
+        )
+
     async def _run_council(self, request: ChatRequest, stream: RequestStream | None) -> ChatCompletion:
         """Multi-agent deliberation with cross-critique and synthesis."""
         members = self.council.select_members(request)

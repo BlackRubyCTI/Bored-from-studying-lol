@@ -219,6 +219,25 @@ class Settings:
     sandbox_timeout_seconds: int = 20
     sandbox_memory_limit_mb: int = 512
 
+    # --- auto-scaler (VRAM-aware model up/down-shift) -----------------------
+    autoscaler_enabled: bool = True
+    autoscaler_safety_factor: float = 1.15
+    autoscaler_min_gain: float = 0.05
+    autoscaler_min_dwell_seconds: int = 120
+    autoscaler_max_changes_per_tick: int = 1
+
+    # --- auto-spawner (headless compute provisioning) ------------------------
+    # Provisioning external compute is opt-in: it spends the user's quota.
+    spawner_enabled: bool = False
+    spawner_providers: list[str] = field(
+        default_factory=lambda: ["kaggle", "hf_spaces", "github_actions", "oracle"]
+    )
+    spawner_min_workers: int = 1
+    spawner_tick_seconds: int = 15
+    spawner_registration_timeout_seconds: int = 900
+    spawner_default_ttl_seconds: int = 3600
+    spawner_max_parallel_provisions: int = 2
+
     # --- External providers -------------------------------------------------
     edge_timeout_seconds: float = 30.0
     edge_max_retries: int = 2
@@ -328,6 +347,28 @@ class Settings:
             max_tool_rounds=_as_int(pick("max_tool_rounds"), defaults.max_tool_rounds),
             sandbox_timeout_seconds=_as_int(pick("sandbox_timeout_seconds"), defaults.sandbox_timeout_seconds),
             sandbox_memory_limit_mb=_as_int(pick("sandbox_memory_limit_mb"), defaults.sandbox_memory_limit_mb),
+            autoscaler_enabled=_as_bool(pick("autoscaler_enabled"), defaults.autoscaler_enabled),
+            autoscaler_safety_factor=_as_float(pick("autoscaler_safety_factor"), defaults.autoscaler_safety_factor),
+            autoscaler_min_gain=_as_float(pick("autoscaler_min_gain"), defaults.autoscaler_min_gain),
+            autoscaler_min_dwell_seconds=_as_int(
+                pick("autoscaler_min_dwell_seconds"), defaults.autoscaler_min_dwell_seconds
+            ),
+            autoscaler_max_changes_per_tick=_as_int(
+                pick("autoscaler_max_changes_per_tick"), defaults.autoscaler_max_changes_per_tick
+            ),
+            spawner_enabled=_as_bool(pick("spawner_enabled"), defaults.spawner_enabled),
+            spawner_providers=_as_list(pick("spawner_providers"), defaults.spawner_providers),
+            spawner_min_workers=_as_int(pick("spawner_min_workers"), defaults.spawner_min_workers),
+            spawner_tick_seconds=_as_int(pick("spawner_tick_seconds"), defaults.spawner_tick_seconds),
+            spawner_registration_timeout_seconds=_as_int(
+                pick("spawner_registration_timeout_seconds"), defaults.spawner_registration_timeout_seconds
+            ),
+            spawner_default_ttl_seconds=_as_int(
+                pick("spawner_default_ttl_seconds"), defaults.spawner_default_ttl_seconds
+            ),
+            spawner_max_parallel_provisions=_as_int(
+                pick("spawner_max_parallel_provisions"), defaults.spawner_max_parallel_provisions
+            ),
             edge_timeout_seconds=_as_float(pick("edge_timeout_seconds"), defaults.edge_timeout_seconds),
             edge_max_retries=_as_int(pick("edge_max_retries"), defaults.edge_max_retries),
             credential_file=pick("credential_file", "") or "",

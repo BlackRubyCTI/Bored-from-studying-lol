@@ -60,6 +60,9 @@ class WorkerConfig:
     ttl_seconds: int = 3600
     reconnect_backoff_seconds: float = 2.0
     reconnect_backoff_max_seconds: float = 60.0
+    #: Absolute unix timestamp when the *session* (kernel, job, instance)
+    #: ends.  The head node uses it to replace the worker before it dies.
+    session_ends_at: float = 0.0
 
     # --- model ------------------------------------------------------------
     model_path: str = ""
@@ -117,6 +120,7 @@ class WorkerConfig:
             bind_port=_int("BIND_PORT", 8081),
             heartbeat_seconds=_int("HEARTBEAT_SECONDS", 20),
             ttl_seconds=_int("TTL_SECONDS", 3600),
+            session_ends_at=_float("SESSION_ENDS_AT", 0.0),
             model_path=_env("MODEL_PATH", "") or "",
             model_repo=_env("MODEL_REPO", "") or "",
             model_filename=_env("MODEL_FILENAME", "") or "",

@@ -28,6 +28,8 @@ dependencies = [
   "psutil>=5.9",
   "numpy>=1.26",
   "pyyaml>=6.0",
+  # OCI request signing (Oracle provisioner)
+  "cryptography>=42",
 ]
 
 [project.optional-dependencies]
@@ -45,7 +47,6 @@ training = [
 ]
 mesh = [
   "paramiko>=3.4",
-  "cryptography>=42",
 ]
 dev = [
   "pytest>=8",

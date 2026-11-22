@@ -158,7 +158,10 @@ PROVIDERS: dict[str, ProviderSpec] = {
         default_model="Qwen2.5-32B-Instruct-AWQ",
         rpm_limit=5,
         notes="T4x2 / P100 kernels, 30h/week quota, no browser captcha.",
-        extra={"secondary_env": "KAGGLE_KEY"},
+        extra={
+            "secondary_env": "KAGGLE_KEY",
+            "metadata_env": {"owner": "KAGGLE_OWNER"},
+        },
     ),
     "hf_spaces": ProviderSpec(
         name="hf_spaces",
@@ -168,6 +171,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         default_model="Qwen2.5-7B-Instruct",
         rpm_limit=20,
         notes="ZeroGPU Spaces; dynamic container spin-up/down.",
+        extra={"metadata_env": {"owner": "HF_OWNER"}},
     ),
     "github_actions": ProviderSpec(
         name="github_actions",
@@ -177,6 +181,13 @@ PROVIDERS: dict[str, ProviderSpec] = {
         default_model="Qwen2.5-7B-Instruct",
         rpm_limit=30,
         notes="Matrix runners; billed minutes burn fast, use for short bursts.",
+        extra={
+            "metadata_env": {
+                "repo": "GITHUB_REPO",
+                "workflow": "GITHUB_WORKFLOW",
+                "ref": "GITHUB_REF",
+            }
+        },
     ),
     "lightning": ProviderSpec(
         name="lightning",
@@ -195,7 +206,20 @@ PROVIDERS: dict[str, ProviderSpec] = {
         default_model="Qwen2.5-7B-Instruct",
         rpm_limit=10,
         notes="Always-free ARM Ampere A1 nodes (up to 4 OCPU / 24GB).",
-        extra={"secondary_env": "OCI_TENANCY", "tertiary_env": "OCI_USER"},
+        extra={
+            "secondary_env": "OCI_TENANCY",
+            "tertiary_env": "OCI_USER",
+            "metadata_env": {
+                "tenancy": "OCI_TENANCY",
+                "user": "OCI_USER",
+                "fingerprint": "OCI_FINGERPRINT",
+                "compartment": "OCI_COMPARTMENT",
+                "image": "OCI_IMAGE",
+                "availability_domain": "OCI_AVAILABILITY_DOMAIN",
+                "ssh_public_key": "OCI_SSH_PUBLIC_KEY",
+                "region": "OCI_REGION",
+            },
+        },
     ),
     "termux": ProviderSpec(
         name="termux",

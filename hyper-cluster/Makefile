@@ -4,7 +4,7 @@ BIN := $(VENV)/bin
 PORT ?= 8080
 WORKER_PORT ?= 8081
 
-.PHONY: help venv install check run run-worker test lint fmt smoke smoke-m1 smoke-m2 worker-bootstrap worker-check clean
+.PHONY: help venv install check run run-worker test lint fmt smoke smoke-m1 smoke-m2 smoke-m3 worker-bootstrap worker-check clean
 
 help:
 	@echo "Hyper-Cluster Omega"
@@ -17,6 +17,7 @@ help:
 	@echo "  make test             run the full test-suite"
 	@echo "  make smoke            run the Milestone 1 smoke test"
 	@echo "  make smoke-m2         run the Milestone 2 smoke test"
+	@echo "  make smoke-m3         run the Milestone 3 smoke test (auto-scaler + spawner)"
 	@echo "  make lint             run ruff over the whole project"
 	@echo "  make clean            remove caches"
 
@@ -46,10 +47,10 @@ test:
 	$(BIN)/python -m pytest tests/ -q
 
 lint:
-	$(BIN)/python -m ruff check core head_node worker tools tests
+	$(BIN)/python -m ruff check core head_node worker tools tests scripts
 
 fmt:
-	$(BIN)/python -m ruff format core head_node worker tools tests
+	$(BIN)/python -m ruff format core head_node worker tools tests scripts
 
 smoke: smoke-m1
 
@@ -58,6 +59,9 @@ smoke-m1:
 
 smoke-m2:
 	$(BIN)/python scripts/smoke_m2.py
+
+smoke-m3:
+	$(BIN)/python scripts/smoke_m3.py
 
 clean:
 	find . -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true

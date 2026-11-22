@@ -42,6 +42,7 @@ from core.protocol import (
     WorkerHeartbeat,
     WorkerHello,
 )
+from head_node.auto_spawner import SpawnRequest
 from head_node.events import EventBus
 from head_node.orchestrator import Orchestrator
 from head_node.request_store import RequestLedger
@@ -381,6 +382,86 @@ def create_app(
     @app.get("/v1/credentials")
     async def credentials(_: str = Depends(require_admin_auth)) -> dict[str, Any]:
         return {"credentials": get_vault(resolved.credential_file).snapshot()}
+
+    # ------------------------------------------------------------------ #
+    # Cluster capacity: VRAM pool, auto-scaler, spawner
+    # ------------------------------------------------------------------ #
+    @app.get("/v1/cluster/vram")
+    async def cluster_vram(_: str = Depends(require_client_auth)) -> dict[str, Any]:
+        """The live, measured VRAM pool of the mesh."""
+        pool = engine.selector.pool()
+        return {
+            "pool": pool.to_dict(),
+            "demand": engine.selector.demand.to_dict(),
+            "target_model": engine.selector.target_model(pool).name
+            if engine.selector.target_model(pool)
+            else None,
+        }
+
+    @app.get("/v1/models/plan")
+    async def models_plan(_: str = Depends(require_client_auth)) -> dict[str, Any]:
+        """The scaling plan the auto-scaler would apply right now (dry run)."""
+        decisions = engine.selector.plan()
+        return {
+            "enabled": resolved.autoscaler_enabled,
+            "decisions": [decision.to_dict() for decision in decisions],
+            "demand": engine.selector.demand.to_dict(),
+        }
+
+    @app.post("/v1/cluster/autoscale")
+    async def run_autoscale(_: str = Depends(require_admin_auth)) -> dict[str, Any]:
+        """Apply the scaling plan immediately (hot-swap the models)."""
+        applied = await engine.autoscale()
+        return {
+            "ok": True,
+            "applied": [decision.to_dict() for decision in applied],
+        }
+
+    @app.get("/v1/speculative/pair")
+    async def speculative_pair(_: str = Depends(require_client_auth)) -> dict[str, Any]:
+        """The draft/verifier pairing computed from the live pool."""
+        pair = engine.selector.draft_pair()
+        return {"pair": pair.to_dict() if pair else None}
+
+    @app.get("/v1/spawner")
+    async def spawner_status(_: str = Depends(require_admin_auth)) -> dict[str, Any]:
+        """The state of the headless provisioner and the TTL rotator."""
+        return engine.spawner.status()
+
+    @app.post("/v1/spawner/provision")
+    async def spawner_provision(
+        payload: dict[str, Any],
+        _: str = Depends(require_admin_auth),
+    ) -> dict[str, Any]:
+        """Provision compute on demand (multi-account failover)."""
+        request = SpawnRequest(
+            provider=str(payload.get("provider") or ""),
+            region=str(payload.get("region") or "unknown"),
+            model=payload.get("model"),
+            family=payload.get("family"),
+            params_b=payload.get("params_b"),
+            vram_gb=float(payload.get("vram_gb") or 0.0),
+            ttl_seconds=int(payload.get("ttl_seconds") or resolved.spawner_default_ttl_seconds),
+            labels={str(k): str(v) for k, v in (payload.get("labels") or {}).items()},
+            head_url=resolved.public_base_url
+            or f"http://{resolved.head_host}:{resolved.head_port}",
+            mesh_token=resolved.mesh_token,
+        )
+        result = await engine.spawner.provision(request)
+        return result.to_dict()
+
+    @app.post("/v1/spawner/rotate")
+    async def spawner_rotate(
+        payload: dict[str, Any],
+        _: str = Depends(require_admin_auth),
+    ) -> dict[str, Any]:
+        """Force the pre-emptive handover of one worker."""
+        worker_id = str(payload.get("worker_id") or "")
+        record = engine.registry.get(worker_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"unknown worker: {worker_id}")
+        action = await engine.spawner.rotate(record)
+        return action.to_dict()
 
     @app.post("/v1/credentials")
     async def add_credential(

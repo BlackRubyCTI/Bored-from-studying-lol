@@ -193,21 +193,94 @@ class CredentialVault:
             return self
 
     def _overlay_environment(self) -> None:
-        """Merge ``HYPER_CRED_<PROVIDER>_<LABEL>`` variables into the vault."""
+        """Merge the environment into the vault.
+
+        Three conventions are honoured, in this order:
+
+        ``HYPER_CRED_<PROVIDER>_<LABEL>``
+            the token of an extra account (multi-account by env);
+        ``HYPER_CRED_<PROVIDER>_<LABEL>_META``
+            a JSON object with that account's metadata (owner, repo, ...);
+        the provider's own ``api_key_env``
+            a single "default" account, used when the provider has no account
+            yet -- this is what makes ``GROQ_API_KEY=`` / ``HF_TOKEN=`` /
+            ``KAGGLE_USERNAME=`` work without an API call.
+        """
         prefix = "HYPER_CRED_"
+        metadata: dict[tuple[str, str], dict[str, Any]] = {}
+        tokens: dict[tuple[str, str], str] = {}
         for key, value in os.environ.items():
             if not key.startswith(prefix) or not value:
                 continue
             remainder = key[len(prefix) :].lower()
-            for provider in PROVIDERS:
-                if remainder.startswith(provider + "_"):
-                    label = remainder[len(provider) + 1 :]
-                    break
-            else:
-                provider, _, label = remainder.partition("_")
+            is_meta = remainder.endswith("_meta")
+            if is_meta:
+                remainder = remainder[: -len("_meta")]
+            provider, label = self._split_provider(remainder)
             if not provider:
                 continue
-            self._upsert(Credential(provider=provider, label=label or "default", token=value))
+            if is_meta:
+                try:
+                    parsed = json.loads(value)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict):
+                    metadata[(provider, label)] = parsed
+                continue
+            tokens[(provider, label or "default")] = value
+
+        for (provider, label), token in tokens.items():
+            credential = Credential(provider=provider, label=label, token=token)
+            credential.metadata.update(metadata.get((provider, label), {}))
+            self._upsert(credential)
+
+        for name, spec in PROVIDERS.items():
+            token = os.environ.get(spec.api_key_env, "").strip()
+            if not token:
+                continue
+            if self._credentials.get(name) and any(
+                cred.label == "default" for cred in self._credentials.get(name, [])
+            ):
+                continue
+            credential = self._provider_credential(spec, token)
+            if credential is not None:
+                self._upsert(credential)
+
+    @staticmethod
+    def _split_provider(remainder: str) -> tuple[str, str]:
+        """Split ``provider_label`` into its parts (providers may contain ``_``)."""
+        for provider in sorted(PROVIDERS, key=len, reverse=True):
+            if remainder.startswith(provider + "_"):
+                return provider, remainder[len(provider) + 1 :]
+        provider, _, label = remainder.partition("_")
+        return provider, label
+
+    @staticmethod
+    def _provider_credential(spec: ProviderSpec, token: str) -> Credential | None:
+        """Build the "default" credential of a provider from the environment."""
+        extra = spec.extra or {}
+        secondary = extra.get("secondary_env")
+        tertiary = extra.get("tertiary_env")
+        metadata: dict[str, Any] = {}
+        for key, env_name in (extra.get("metadata_env") or {}).items():
+            value = os.environ.get(env_name, "").strip()
+            if value:
+                metadata[key] = value
+        if secondary:
+            second = os.environ.get(secondary, "").strip()
+            if not second:
+                return None
+            if spec.name == "kaggle":
+                # Kaggle authenticates with "username:key" (HTTP Basic).
+                token = f"{token}:{second}"
+            else:
+                metadata["secondary"] = second
+        if tertiary:
+            third = os.environ.get(tertiary, "").strip()
+            if not third:
+                return None
+            metadata["tertiary"] = third
+        return Credential(provider=spec.name, label="default", token=token, metadata=metadata)
 
     def save(self) -> None:
         """Persist the vault to disk with ``0600`` permissions."""

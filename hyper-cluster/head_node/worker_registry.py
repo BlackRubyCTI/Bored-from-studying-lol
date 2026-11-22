@@ -49,6 +49,27 @@ def _ewma(old: float, new: float, alpha: float) -> float:
     return (1.0 - alpha) * old + alpha * new
 
 
+def _node_throughput(caps: Capabilities) -> float:
+    """The throughput the worker measured in its own benchmark."""
+    try:
+        return float(caps.extra.get("throughput_tps") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _node_factor(caps: Capabilities, hello: WorkerHello) -> float:
+    """``tokens/s * B`` -- the hardware factor of the node.
+
+    Together with the size of the model a node hosts, this lets the head
+    node estimate how fast *another* model would run on the same hardware.
+    """
+    throughput = _node_throughput(caps)
+    params = float(caps.extra.get("benchmark_params_b") or hello.model_params_b or 0.0)
+    if throughput <= 0.0 or params <= 0.0:
+        return 0.0
+    return throughput * params
+
+
 @dataclass
 class WorkerRecord:
     """Live state of a single worker."""
@@ -69,6 +90,10 @@ class WorkerRecord:
     vram_free_gb: float = 0.0
     compute_tflops: float = 0.0
     tokens_per_sec: float = 0.0
+    #: ``tokens/s * B`` of the node's own benchmark.  It is a property of the
+    #: hardware, so it survives a model hot-swap and lets the head node
+    #: estimate the throughput of a *different* model on the same node.
+    node_tps_per_b: float = 0.0
     ttft_ms: float = 0.0
     mesh_latency_ms: float = 0.0
     inflight: int = 0
@@ -212,7 +237,8 @@ class WorkerRegistry:
                     vram_total_gb=caps.vram_total_gb,
                     vram_free_gb=caps.vram_free_gb,
                     compute_tflops=caps.compute_tflops,
-                    tokens_per_sec=max(caps.mesh_latency_ms * 0.0, 0.0),
+                    tokens_per_sec=_node_throughput(caps),
+                    node_tps_per_b=_node_factor(caps, hello),
                     mesh_latency_ms=caps.mesh_latency_ms,
                     registered_at=now,
                     last_heartbeat=now,
@@ -244,6 +270,8 @@ class WorkerRegistry:
             existing.vram_total_gb = caps.vram_total_gb
             existing.vram_free_gb = caps.vram_free_gb
             existing.compute_tflops = caps.compute_tflops
+            existing.tokens_per_sec = _node_throughput(caps) or existing.tokens_per_sec
+            existing.node_tps_per_b = _node_factor(caps, hello) or existing.node_tps_per_b
             existing.mesh_latency_ms = caps.mesh_latency_ms or existing.mesh_latency_ms
             existing.last_heartbeat = now
             existing.expires_at = now + effective_ttl
@@ -417,6 +445,32 @@ class WorkerRegistry:
             (r for r in records if not r.draining and r.expires_at <= horizon),
             key=lambda r: r.expires_at,
         )
+
+    def session_ending_within(self, seconds: float) -> list[WorkerRecord]:
+        """Workers whose *session* (kernel, job, instance) ends within ``seconds``.
+
+        A worker reports the absolute end of its session in its registration
+        metadata (``session_ends_at``).  Unlike the liveness TTL -- which every
+        heartbeat refreshes -- this deadline really does approach, so it is
+        the signal the pre-emptive rotator acts on.
+        """
+        with self._lock:
+            records = list(self._workers.values())
+        horizon = now_s() + seconds
+        ending: list[WorkerRecord] = []
+        for record in records:
+            if record.draining:
+                continue
+            raw = record.metadata.get("session_ends_at")
+            try:
+                session_end = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if session_end <= 0:
+                continue
+            if session_end <= horizon:
+                ending.append(record)
+        return sorted(ending, key=lambda r: float(r.metadata.get("session_ends_at", 0.0)))
 
     # ------------------------------------------------------------------ #
     def claim(self, worker_id: str, count: int = 1) -> bool:

@@ -142,6 +142,7 @@ class WorkerAgent:
                 "backend": self.engine.info().backend,
                 "provider": self.config.provider,
                 "region": self.config.region,
+                "session_ends_at": self.config.session_ends_at,
             },
         )
         try:
@@ -187,6 +188,7 @@ class WorkerAgent:
                 families=[self.config.model_family, "qwen2", "llama", "gemma2", "phi3", "mistral"],
                 context=self.config.context_size,
                 max_concurrency=self.config.max_concurrency,
+                model_params_b=self.config.model_params_b,
             )
         from core.protocol import Capabilities
 

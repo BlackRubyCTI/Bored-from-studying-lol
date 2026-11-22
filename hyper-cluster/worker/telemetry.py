@@ -472,6 +472,7 @@ def capabilities_from_report(
     context: int = 8192,
     max_concurrency: int = 2,
     device: str | None = None,
+    model_params_b: float = 0.0,
 ) -> Any:
     """Convert a benchmark report into the wire-protocol capability payload."""
     from core.protocol import Capabilities
@@ -521,6 +522,11 @@ def capabilities_from_report(
             "cpu": report.cpu.to_dict(),
             "flops": report.flops.to_dict(),
             "head_latency": report.head_latency.to_dict(),
+            # The head node needs the throughput *and* the size it was
+            # measured with: ``tokens/s * B`` is the node's hardware factor
+            # and stays valid after a hot-swap to a different model.
+            "throughput_tps": round(report.tokens_per_sec, 3),
+            "benchmark_params_b": model_params_b,
         },
     )
 
