@@ -99,8 +99,24 @@ def build_pdf(text: str) -> bytes:
     return bytes(out)
 
 
+
+def fresh_dir(path: str) -> Path:
+    """A clean data directory -- every run of a smoke starts from scratch.
+
+    Without it the state of the previous run leaks into the next one (the
+    memory grows, the ranking drifts) and the smoke stops being repeatable.
+    """
+    import shutil
+
+    target = Path(path)
+    shutil.rmtree(target, ignore_errors=True)
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+
 async def main() -> int:
-    data_dir = Path("/tmp/hypercluster-smoke-m5")
+    data_dir = fresh_dir("/tmp/hypercluster-smoke-m5")
     settings = Settings(
         data_dir=str(data_dir),
         log_level="WARNING",

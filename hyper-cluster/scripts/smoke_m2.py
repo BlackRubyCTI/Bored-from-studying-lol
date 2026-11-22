@@ -55,9 +55,25 @@ async def wait_for_workers(client: httpx.AsyncClient, base: str, count: int, tim
     return workers
 
 
+
+def fresh_dir(path: str) -> Path:
+    """A clean data directory -- every run of a smoke starts from scratch.
+
+    Without it the state of the previous run leaks into the next one (the
+    memory grows, the ranking drifts) and the smoke stops being repeatable.
+    """
+    import shutil
+
+    target = Path(path)
+    shutil.rmtree(target, ignore_errors=True)
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+
 async def main() -> int:
     settings = Settings(
-        data_dir="/tmp/hypercluster-smoke-m2",
+        data_dir=str(fresh_dir("/tmp/hypercluster-smoke-m2")),
         log_level="WARNING",
         log_json=False,
         worker_ttl_seconds=300,

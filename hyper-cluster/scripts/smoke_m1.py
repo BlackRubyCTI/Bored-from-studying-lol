@@ -132,11 +132,27 @@ def run_server(app: FastAPI, port: int) -> uvicorn.Server:
 
 
 # --------------------------------------------------------------------------- #
+
+def fresh_dir(path: str) -> Path:
+    """A clean data directory -- every run of a smoke starts from scratch.
+
+    Without it the state of the previous run leaks into the next one (the
+    memory grows, the ranking drifts) and the smoke stops being repeatable.
+    """
+    import shutil
+
+    target = Path(path)
+    shutil.rmtree(target, ignore_errors=True)
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+
 def main() -> int:
     """Run the smoke test."""
     head_port = free_port()
     worker_port = free_port()
-    data_dir = Path("/tmp/hyper-cluster-smoke")
+    data_dir = fresh_dir("/tmp/hyper-cluster-smoke")
     data_dir.mkdir(parents=True, exist_ok=True)
 
     print("\n⚡ Hyper-Cluster Omega — Milestone 1 smoke test\n")
