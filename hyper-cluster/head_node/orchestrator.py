@@ -132,6 +132,7 @@ class Orchestrator:
         spawner: AutoSpawner | None = None,
         memory: VectorMemory | None = None,
         autopilot: AutopilotEvolver | None = None,
+        notifier: Any | None = None,
     ) -> None:
         self.settings = settings if settings is not None else Settings.from_env()
         # NOTE: every collaborator is resolved with an explicit ``is not None``
@@ -196,6 +197,11 @@ class Orchestrator:
             autopilot
             if autopilot is not None
             else self._build_autopilot()
+        )
+        self.notifier = (
+            notifier
+            if notifier is not None
+            else self._build_notifier()
         )
         self._capacity_event = asyncio.Event()
         self._background: list[asyncio.Task[Any]] = []
@@ -267,6 +273,22 @@ class Orchestrator:
             events=self.events,
         )
 
+    def _build_notifier(self) -> Any | None:
+        """Wire the phone alerts (Milestone 5)."""
+        if not self.settings.notifier_enabled:
+            return None
+        from mobile.notifier import Notifier
+
+        notifier = Notifier(
+            telegram_token=self.settings.notifier_telegram_token,
+            telegram_chat_id=self.settings.notifier_telegram_chat_id,
+            webhook_url=self.settings.notifier_webhook_url,
+            webhook_secret=self.settings.notifier_webhook_secret,
+            events=self.settings.notifier_events or None,
+            min_interval_seconds=self.settings.notifier_min_interval_seconds,
+        )
+        return notifier if notifier.enabled else None
+
     def _shard_dispatch(self, payload: dict[str, Any]) -> Any:
         """Send one training shard to a worker (round-robin over the mesh)."""
         workers = self.registry.healthy_workers()
@@ -291,6 +313,13 @@ class Orchestrator:
         self._background.append(asyncio.create_task(self._spawner_loop(), name="hc-spawner-loop"))
         if self.autopilot is not None:
             self.autopilot.start()
+        if self.notifier is not None:
+            self._background.append(
+                asyncio.create_task(
+                    self.notifier.run(self.events.subscribe, self.events.unsubscribe),
+                    name="hc-notifier-loop",
+                )
+            )
         LOGGER.info("orchestrator started", extra={"hc_workers": len(self.registry)})
 
     async def shutdown(self) -> None:
@@ -306,6 +335,8 @@ class Orchestrator:
         self._background.clear()
         if self.autopilot is not None:
             await self.autopilot.aclose()
+        if self.notifier is not None:
+            await self.notifier.aclose()
         await self.edge.aclose()
         await self.client.aclose()
         await self.spawner.aclose()
@@ -1317,7 +1348,7 @@ class Orchestrator:
             edge_healthy=edge_healthy,
             workers=workers,
             mode=RequestMode.AUTO,
-            autopilot=False,
+            autopilot=bool(self.autopilot is not None and self.autopilot.enabled),
             uptime_seconds=round(now_s() - self._started_at, 1),
         )
 

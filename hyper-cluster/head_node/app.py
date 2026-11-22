@@ -57,6 +57,7 @@ from head_node.events import EventBus
 from head_node.orchestrator import Orchestrator
 from head_node.request_store import RequestLedger
 from head_node.worker_registry import WorkerRegistry
+from memory.pdf import extract_pdf_text, is_pdf
 from tools.sandbox import PythonSandbox, ToolExecutor
 
 LOGGER = get_logger("head_node.app")
@@ -516,21 +517,40 @@ def create_app(
         file: UploadFile = File(...),
         _: str = Depends(require_client_auth),
     ) -> dict[str, Any]:
-        """Upload a document -- it is indexed immediately."""
+        """Upload a document -- it is indexed immediately.
+
+        PDFs are unpacked on the fly (the text layer is extracted), so the
+        papers the phone drops into the chat end up in the memory.
+        """
         memory = _require_memory()
         payload = await file.read()
         if not payload:
             raise HTTPException(status_code=422, detail="the uploaded file is empty")
+        name = file.filename or "upload"
+        if is_pdf(payload, name):
+            text, extra = extract_pdf_text(payload)
+            if not text.strip():
+                detail = "; ".join(extra.get("pdf_warnings") or []) or "no text could be extracted"
+                raise HTTPException(status_code=415, detail=f"the PDF has no readable text: {detail}")
+            record = memory.add_document(
+                name,
+                text,
+                metadata={"source_path": name, "size": len(payload), **extra},
+            )
+            return {"ok": True, "document": record.to_dict(), "extracted": True, **extra}
         try:
             text = payload.decode("utf-8")
         except UnicodeDecodeError:
-            raise HTTPException(status_code=415, detail="only text files can be indexed") from None
+            raise HTTPException(
+                status_code=415,
+                detail="only text files and PDFs can be indexed",
+            ) from None
         record = memory.add_document(
-            file.filename or "upload",
+            name,
             text,
-            metadata={"source_path": file.filename or "", "size": len(payload)},
+            metadata={"source_path": name, "size": len(payload)},
         )
-        return {"ok": True, "document": record.to_dict()}
+        return {"ok": True, "document": record.to_dict(), "extracted": False}
 
     @app.post("/v1/memory/sync")
     async def memory_sync(
@@ -601,6 +621,20 @@ def create_app(
             raise HTTPException(status_code=409, detail="the evolution engine is disabled")
         report = await engine.autopilot.run_cycle(dataset_size=payload.get("dataset_size"))
         return report.to_dict()
+
+    @app.post("/v1/evolution/toggle")
+    async def evolution_toggle(
+        payload: dict[str, Any],
+        _: str = Depends(require_admin_auth),
+    ) -> dict[str, Any]:
+        """Turn the sleep-time engine on or off (the phone's autopilot switch)."""
+        if engine.autopilot is None:
+            raise HTTPException(status_code=409, detail="the evolution engine is disabled")
+        enabled = payload.get("enabled")
+        if enabled is None:
+            enabled = not engine.autopilot.enabled
+        engine.autopilot.set_enabled(bool(enabled))
+        return {"ok": True, "enabled": engine.autopilot.enabled, **engine.autopilot.status()}
 
     @app.post("/v1/evolution/prompt")
     async def evolution_prompt(

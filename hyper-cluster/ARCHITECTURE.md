@@ -76,7 +76,7 @@
 | **2 — Self-benchmarking worker, mesh & tool sandbox** | `worker/{bootstrap.sh,worker_agent.py,telemetry.py,inference_engine.py,mesh.py}`, `tools/sandbox.py`, Tailscale mesh | ✅ **complete** |
 | **3 — Headless API compute spawner & VRAM auto-scaler** | `head_node/{auto_spawner.py,model_selector.py}` | ✅ **complete** |
 | **4 — Infinite memory & sleep-time self-evolution** | `memory/{vector_memory,sync}.py`, `training/{autopilot_evolver,self_play,synthetic_data,prompt_evolver,distributed_trainer,checkpoint_streamer,qlora}.py`, `worker/brain.py` | ✅ **complete** |
-| 5 — Mobile PWA mission control, phone alerts, one-command installer | `mobile/{dashboard.py,cli.py,notifier.py}`, `install_all.sh` | ⏳ |
+| **5 — Mobile PWA mission control, phone alerts, one-command installer** | `mobile/{dashboard.py,cli.py,notifier.py,qr.py}`, `mobile/static/*`, `memory/pdf.py`, `install_all.sh` | ✅ **complete** |
 
 ---
 
@@ -475,13 +475,131 @@ The training never claims worker capacity, so a preempted run cannot leave a wor
 | `GET /v1/evolution/status` | the state of the engine, the phase, the preemption latency |
 | `POST /v1/evolution/run` | run one self-evolution cycle now |
 | `POST /v1/evolution/prompt` | set the system prompt of the cluster |
+| `POST /v1/evolution/toggle` | the phone's autopilot switch (on/off, effective at once) |
 
-### 6.5 Milestone 5 — mission control
-* `mobile/dashboard.py` — dark-mode, touch-first PWA (streaming chat, voice in/out, drag-and-drop
-  RAG upload, council toggle, autopilot switch, live GPU/VRAM/tok-s telemetry).
-* `mobile/notifier.py` — Telegram/webhook push when a better model ships or a key needs attention.
-* `install_all.sh` — one command: `.env` wizard, Drive + HF wiring, systemd/Termux autostart,
-  LAN URL + terminal QR code.
+### 6.5 Milestone 5 — the mobile mission control (implemented)
+
+The phone is the only screen the user is guaranteed to have.  Milestone 5
+turns the cluster into something you drive from a phone: a dark, touch-first
+PWA that streams the answers, a terminal that works in Termux, alerts that
+push to the pocket and an installer that wires the whole thing up in one
+command.
+
+#### 6.5.1 The dashboard (`mobile/dashboard.py`)
+
+A small FastAPI app with two jobs:
+
+1. **The shell** — `index.html`, `styles.css`, `app.js`, `manifest.webmanifest`,
+   `sw.js` and `icon.svg` are served from `mobile/static/`.  No framework, no
+   build step, no CDN: the phone may be offline and the shell still opens.
+2. **The proxy** — everything under `/api/` is forwarded to the head node
+   (`HYPER_DASHBOARD_HEAD_URL`) with the method, the body, the query and the
+   authentication headers.  `text/event-stream` answers are relayed chunk by
+   chunk, so the chat really streams *through* the dashboard.
+
+The catch-all route that serves the shell is registered **after** the proxy,
+so `/api/...` can never be shadowed by the static files.
+
+```
+phone ──HTTP/SSE──▶ dashboard (:8082) ──HTTP/SSE──▶ head node (:8080)
+        │                   │                            │
+        │                   └── /api/* proxy ───────────┘
+        └── /, /app.js, /sw.js  (the shell)
+```
+
+The PWA itself:
+
+| Element | Implementation |
+|---|---|
+| Chat | `fetch` + a `ReadableStream` reader that appends every `token` event |
+| Voice in | `SpeechRecognition` / `webkitSpeechRecognition` — the transcript lands in the composer |
+| Voice out | `speechSynthesis` with the voice chosen in the settings sheet |
+| PDF upload | a file picker **and** a drag-and-drop target; the file goes to `POST /v1/memory/documents` |
+| Council | `mode: "council"` on the next request |
+| Autopilot | `POST /v1/evolution/toggle` (admin token) — the engine stops *immediately* |
+| Telemetry | `GET /v1/status` every three seconds: workers, free VRAM, tok/s, model, queue |
+| Offline | a service worker caches the shell only — an API answer is never cached |
+
+#### 6.5.2 The PDF reader (`memory/pdf.py`)
+
+`pypdf`, `PyPDF2` and `fitz` are **not** dependencies of this project (and
+Termux would need another package), so the text layer is extracted with the
+standard library only:
+
+* the objects are scanned out of the file (`N 0 obj … endobj`),
+* the streams are inflated (`zlib`, with the raw-deflate fallback),
+* the PNG predictors are undone (the `/Predictor` of the filters),
+* the fonts are resolved (the resource names of the page are mapped to the
+  font objects),
+* the `ToUnicode` CMaps are parsed (including the `bfchar`/`bfrange`
+  sections) so a subset font decodes to real characters,
+* the text operators (`Tj`, `TJ`, `'`, `"`) are executed and the escapes are
+  undone.
+
+A PDF that is encrypted, scanned or broken never raises into the request
+path: the upload answers **415** with the reason ("the PDF has no readable
+text: …").
+
+#### 6.5.3 The notifier (`mobile/notifier.py`)
+
+The notifier subscribes to the head node's event bus and pushes the
+interesting events to the pocket:
+
+* **Telegram** — the bot API (`sendMessage`), so the phone gets a real push.
+* **A webhook** — any URL that accepts JSON (ntfy, a relay, your own server),
+  optionally signed with `x-hyper-secret`.
+
+Both transports are best effort: a failed push is counted, logged and
+dropped — it never blocks the event bus or the request path.  A throttle
+(`HYPER_NOTIFIER_MIN_INTERVAL_SECONDS`) keeps a burst of events from turning
+into a flood.
+
+#### 6.5.4 The Termux CLI (`mobile/cli.py`)
+
+`hc` is the same cluster from a terminal (Termux, SSH, `adb shell`):
+
+```
+hc status | workers | watch | memory | evolution | qr | config
+hc chat "…" | ask | upload paper.pdf
+```
+
+The settings live in `~/.hypercluster/client.json` (`0600`).
+
+#### 6.5.5 The QR encoder (`mobile/qr.py`)
+
+`qrencode` is not everywhere (and Termux would need a package), so the
+installer ships its own encoder: byte mode, error correction level M,
+versions 1–10, the eight masks with the standard penalty rules and a
+terminal renderer that uses the half-block characters (`▀`).  The encoder is
+verified against the ISO/IEC 18004 layout (finder, timing and alignment
+patterns, the format information, the zigzag placement) and it round-trips
+through its own reader.
+
+#### 6.5.6 The installer (`install_all.sh`)
+
+One command, seven steps:
+
+1. detect the platform (Linux / macOS / Termux on Android),
+2. check Python (≥ 3.10),
+3. create the virtualenv and install the dependencies,
+4. write a complete `.env` (atomic, mode `0600`; the previous one is backed
+   up; the secrets are generated when they are missing),
+5. wire the Google Drive and the Hugging Face sync,
+6. install the auto-boot service (a systemd unit on Linux, a
+   `~/.termux/boot` script on Android, a launcher everywhere else),
+7. print the QR code of the dashboard and the launch command.
+
+It is idempotent: a second run only refreshes what is missing.
+
+#### 6.5.7 The dashboard routes
+
+| Route | Purpose |
+|---|---|
+| `GET /` | the PWA shell |
+| `GET /styles.css`, `/app.js`, `/sw.js`, `/icon.svg`, `/manifest.webmanifest` | the assets of the shell |
+| `GET /health` | is the head node reachable? |
+| `GET /api/config` | what the phone needs to know (the head node, the features) |
+| `* /api/*` | the proxy to the head node (every method, streaming included) |
 
 ---
 
@@ -500,9 +618,10 @@ hyper-cluster/
 │   └── bootstrap.sh         zero-touch provisioning
 ├── tools/                   tool-use sandbox (M2 ✅)
 │   └── sandbox.py           python isolation, web, files, tool protocol
-├── memory/                  vector memory   (M4 ✅)
+├── memory/                  vector memory   (M4 ✅, M5 ✅)
 │   ├── vector_memory.py     store, hybrid retrieval, facts, snapshots
-│   └── sync.py              Drive + Hub sync, resumable uploads, checksums
+│   ├── sync.py              Drive + Hub sync, resumable uploads, checksums
+│   └── pdf.py               the standard-library PDF text extractor (M5 ✅)
 ├── training/                self-evolution  (M4 ✅)
 │   ├── autopilot_evolver.py the idle watchdog + the preemption contract
 │   ├── synthetic_data.py    mining + deterministic mutations
@@ -511,9 +630,15 @@ hyper-cluster/
 │   ├── qlora.py             the maths (ridge, int8, SVD, merge)
 │   ├── checkpoint_streamer.py push/pull the training state
 │   └── prompt_evolver.py    mutate, benchmark, promote
-├── mobile/                  PWA + notifier  (M5 ⏳)
-├── tests/                   live test-suite (232 tests, real HTTP + SSE)
-├── scripts/                 smoke harnesses (M1 + M2 + M3 + M4)
+├── mobile/                  the mission control  (M5 ✅)
+│   ├── dashboard.py         the PWA + the API proxy
+│   ├── notifier.py          Telegram + webhook alerts
+│   ├── cli.py               the Termux command line (hc)
+│   ├── qr.py                the dependency-free QR encoder
+│   └── static/              the shell (HTML, CSS, JS, manifest, service worker, icon)
+├── tests/                   live test-suite (331 tests, real HTTP + SSE)
+├── scripts/                 smoke harnesses (M1 + M2 + M3 + M4 + M5)
+├── install_all.sh           the one-command installer (M5 ✅)
 ├── .env.example             configuration template
 ├── ARCHITECTURE.md          this document
 └── pyproject.toml

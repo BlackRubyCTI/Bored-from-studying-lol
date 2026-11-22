@@ -272,6 +272,32 @@ class Settings:
     evolution_train_vocab: int = 128
     evolution_checkpoint_dir: str = ""
 
+    # --- phone alerts (milestone 5) ----------------------------------------
+    #: Whether the cluster may push to the phone.
+    notifier_enabled: bool = False
+    #: The Telegram bot and the chat it writes to.
+    notifier_telegram_token: str = ""
+    notifier_telegram_chat_id: str = ""
+    #: A generic webhook (ntfy, a push relay, ...).
+    notifier_webhook_url: str = ""
+    notifier_webhook_secret: str = ""
+    #: Which events are pushed (empty = the defaults).
+    notifier_events: list[str] = field(default_factory=list)
+    #: The minimum delay between two pushes.
+    notifier_min_interval_seconds: float = 0.0
+
+    # --- mobile dashboard (milestone 5) -------------------------------------
+    #: Whether the dashboard is served next to the control plane.
+    dashboard_enabled: bool = True
+    #: The address the dashboard binds to.
+    dashboard_host: str = "0.0.0.0"
+    #: The port of the dashboard (0 = the same port as the control plane).
+    dashboard_port: int = 8082
+    #: The public base URL of the dashboard (used by the QR code).
+    dashboard_public_url: str = ""
+    #: The head node the dashboard proxies to.
+    dashboard_head_url: str = "http://127.0.0.1:8080"
+
     # --- cloud sync (milestone 4) -------------------------------------------
     #: The token of the Google Drive service account / OAuth client.
     drive_token: str = ""
@@ -437,6 +463,20 @@ class Settings:
             evolution_train_dim=_as_int(pick("evolution_train_dim"), defaults.evolution_train_dim),
             evolution_train_vocab=_as_int(pick("evolution_train_vocab"), defaults.evolution_train_vocab),
             evolution_checkpoint_dir=pick("evolution_checkpoint_dir", "") or "",
+            notifier_enabled=_as_bool(pick("notifier_enabled"), defaults.notifier_enabled),
+            notifier_telegram_token=pick("notifier_telegram_token", "") or "",
+            notifier_telegram_chat_id=pick("notifier_telegram_chat_id", "") or "",
+            notifier_webhook_url=pick("notifier_webhook_url", "") or "",
+            notifier_webhook_secret=pick("notifier_webhook_secret", "") or "",
+            notifier_events=list(pick("notifier_events", []) or []),
+            notifier_min_interval_seconds=_as_float(
+                pick("notifier_min_interval_seconds"), defaults.notifier_min_interval_seconds
+            ),
+            dashboard_enabled=_as_bool(pick("dashboard_enabled"), defaults.dashboard_enabled),
+            dashboard_host=pick("dashboard_host", defaults.dashboard_host) or defaults.dashboard_host,
+            dashboard_port=_as_int(pick("dashboard_port"), defaults.dashboard_port),
+            dashboard_public_url=pick("dashboard_public_url", "") or "",
+            dashboard_head_url=pick("dashboard_head_url", "") or defaults.dashboard_head_url,
             drive_token=pick("drive_token", "") or "",
             drive_api_base=pick("drive_api_base", defaults.drive_api_base),
             drive_upload_base=pick("drive_upload_base", defaults.drive_upload_base),

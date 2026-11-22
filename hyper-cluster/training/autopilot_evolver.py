@@ -135,13 +135,32 @@ class AutopilotEvolver:
         self._preempt_requested_at = 0.0
         #: The stage of the current cycle ("mine", "self-play", "training", ...).
         self.phase = "idle"
+        #: A runtime override of ``settings.evolution_enabled`` (the phone's switch).
+        self._enabled_override: bool | None = None
 
     # ------------------------------------------------------------------ #
     # Configuration helpers
     # ------------------------------------------------------------------ #
     @property
     def enabled(self) -> bool:
+        """Whether the engine may learn right now.
+
+        The setting is the default; the phone's autopilot switch overrides
+        it at runtime (and the override survives until it is cleared).
+        """
+        if self._enabled_override is not None:
+            return self._enabled_override
         return bool(getattr(self.settings, "evolution_enabled", False))
+
+    def set_enabled(self, enabled: bool) -> bool:
+        """Turn the engine on or off at runtime."""
+        self._enabled_override = bool(enabled)
+        if not enabled:
+            # A running cycle stops immediately.
+            self.token.preempt("autopilot switched off")
+            self.state = STATE_PREEMPTED if self.state == STATE_TRAINING else self.state
+        LOGGER.info("evolution toggled", extra={"hc_enabled": self._enabled_override})
+        return self.enabled
 
     @property
     def idle_seconds(self) -> float:
@@ -196,7 +215,10 @@ class AutopilotEvolver:
                     continue
                 idle_for = now_s() - self.last_activity
                 if idle_for < self.idle_seconds:
-                    self.state = STATE_WAITING
+                    # A preemption is *sticky*: the phone has to be able to
+                    # see that the user won (the next cycle resets it).
+                    if self.state != STATE_PREEMPTED:
+                        self.state = STATE_WAITING
                     continue
                 self.state = STATE_IDLE
                 await self.run_cycle()

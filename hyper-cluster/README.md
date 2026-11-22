@@ -3,10 +3,11 @@
 **Zero-limit autonomous AI operating system.**
 A headless GPU compute pool, a sub-second inference path, and a phone-first mission control.
 
-> Milestones 1 to 4 of 5 are complete and verified:
+> All five milestones are complete and verified:
 > **M1** — control plane & resilient orchestrator · **M2** — self-benchmarking worker, mesh & tool sandbox ·
 > **M3** — headless compute spawner, VRAM auto-scaler & speculative pairing ·
-> **M4** — infinite memory & sleep-time self-evolution.
+> **M4** — infinite memory & sleep-time self-evolution ·
+> **M5** — the mobile mission control (PWA, phone alerts, Termux CLI, one-command installer).
 
 ---
 
@@ -76,6 +77,24 @@ A headless GPU compute pool, a sub-second inference path, and a phone-first miss
 | Eight new control-plane routes (`/v1/memory*`, `/v1/evolution/*`) | `head_node/app.py` |
 | 232 tests, including **live preemption of a running training** | `tests/` |
 
+### Milestone 5 — the mobile mission control
+
+| Capability | Where |
+|---|---|
+| **Dark-mode, touch-first PWA** (no framework, no build step, works offline) | `mobile/static/index.html`, `mobile/static/styles.css`, `mobile/static/app.js` |
+| The dashboard server: the PWA **and** an API proxy (one origin for the phone) | `mobile/dashboard.py` |
+| Streaming chat (Server-Sent Events proxied token by token) | `mobile/dashboard.py`, `mobile/static/app.js` |
+| Voice input (Web Speech API) and voice output (`speechSynthesis`) | `mobile/static/app.js` |
+| Drag-and-drop **PDF RAG upload** — the text layer is extracted on the fly | `memory/pdf.py`, `head_node/app.py` |
+| A dependency-free PDF reader (Flate, PNG predictors, `ToUnicode` CMaps, Type0) | `memory/pdf.py` |
+| Council Mode and Autopilot switches (the autopilot is stopped **immediately**) | `mobile/static/app.js`, `head_node/app.py` |
+| Live GPU, VRAM and tokens-per-second telemetry | `mobile/static/app.js`, `head_node/app.py` |
+| **Phone alerts**: Telegram and webhook pushes of the cluster events | `mobile/notifier.py` |
+| The **Termux CLI** (`hc status`, `hc chat`, `hc upload`, `hc watch`, `hc qr`, …) | `mobile/cli.py` |
+| A dependency-free **QR encoder** (the phone scans the dashboard address) | `mobile/qr.py` |
+| The **one-command installer**: `.env` wizard, Drive + Hub wiring, systemd/Termux autostart, QR code | `install_all.sh` |
+| 331 tests, including a **live** dashboard, a real PDF upload and the preemption race | `tests/` |
+
 ---
 
 ## Quick start
@@ -83,7 +102,10 @@ A headless GPU compute pool, a sub-second inference path, and a phone-first miss
 ```bash
 cd /home/user/hyper-cluster
 
-# 1. environment
+# 0. the whole thing (venv, .env, Drive + Hub, autostart, QR code)
+./install_all.sh
+
+# 1. environment (or the wizard above)
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env && nano .env        # set HYPER_API_KEY / HYPER_MESH_TOKEN
@@ -91,8 +113,9 @@ cp .env.example .env && nano .env        # set HYPER_API_KEY / HYPER_MESH_TOKEN
 # 2. validate the installation
 python -m head_node.serve --check
 
-# 3. run the control plane
-python -m head_node.serve --host 0.0.0.0 --port 8080
+# 3. run the control plane *and* the mission control
+python -m head_node.serve --host 0.0.0.0 --port 8080   # the API
+python -m mobile.dashboard --host 0.0.0.0 --port 8082   # the phone
 ```
 
 ```bash
@@ -152,6 +175,54 @@ in the sandbox and feeds the output back.
 
 ---
 
+## The phone (Mission Control)
+
+The dashboard is a PWA: dark by default, thumb-sized targets, no framework
+and no build step.  It is served on its own port and proxies the API, so
+the phone only ever talks to one origin.
+
+```bash
+python -m mobile.dashboard --host 0.0.0.0 --port 8082
+# → open http://<your-ip>:8082 on the phone
+# → or scan the QR code that install_all.sh prints
+```
+
+| On the phone | What it does |
+|---|---|
+| The chat | The answer streams in token by token (SSE through the proxy) |
+| The 🎤 button | Voice input (Web Speech API) — the words land in the composer |
+| The 🔊 switch | The answer is read out loud (`speechSynthesis`, any installed voice) |
+| The 📎 button / a drop | A PDF is uploaded, its text layer is extracted and indexed at once |
+| **Council** | The next answer is written by a panel (`mode: council`) |
+| **Autopilot** | The sleep-time engine is switched on or off — off means the training stops *now* |
+| The telemetry strip | Workers, free VRAM, tokens/second, the live model, the queue |
+
+The terminal is a first-class citizen too — inside Termux, over SSH or
+through `adb shell`:
+
+```bash
+hc status                       # the cluster at a glance
+hc chat "what can you do?"      # one answer
+hc ask                          # a conversation
+hc workers                      # the mesh
+hc watch                        # live telemetry
+hc upload paper.pdf             # teach the cluster (the PDF is extracted)
+hc memory "who is on call"      # what does it remember
+hc evolution                    # the sleep-time engine
+hc qr                           # the QR code of the dashboard
+```
+
+And the cluster can call the phone back:
+
+```bash
+HYPER_NOTIFIER_ENABLED=1
+HYPER_NOTIFIER_TELEGRAM_TOKEN=…          # from @BotFather
+HYPER_NOTIFIER_TELEGRAM_CHAT_ID=…
+HYPER_NOTIFIER_WEBHOOK_URL=https://ntfy.sh/hyper-cluster
+```
+
+---
+
 ## Configuration
 
 Everything is environment driven (`HYPER_*` prefix for the control plane,
@@ -191,12 +262,13 @@ between accounts automatically.
 ## Verification
 
 ```bash
-make test        # 232 tests: live HTTP/SSE servers, failover, sandbox, mesh, bootstrap, auto-scaler, memory, self-evolution
-make lint        # ruff over core/head_node/worker/tools/memory/training/tests/scripts
+make test        # 331 tests: live HTTP/SSE servers, failover, sandbox, mesh, bootstrap, auto-scaler, memory, self-evolution, mobile
+make lint        # ruff over core/head_node/worker/tools/memory/training/mobile/tests/scripts
 make smoke       # Milestone 1 smoke test (23 checks)
 make smoke-m2    # Milestone 2 smoke test (31 checks)
 make smoke-m3    # Milestone 3 smoke test (27 checks: hot-swap, scaling, zero-downtime hand-over)
 make smoke-m4    # Milestone 4 smoke test (40 checks: memory, cloud sync, self-evolution, instant preemption)
+make smoke-m5    # Milestone 5 smoke test (39 checks: the PWA, the proxy, the PDF, the alerts, the QR)
 ```
 
 ---
@@ -207,6 +279,6 @@ make smoke-m4    # Milestone 4 smoke test (40 checks: memory, cloud sync, self-e
 2. ✅ **Self-benchmarking worker, mesh & tool sandbox**
 3. ✅ **Headless API compute spawner & VRAM auto-scaler**
 4. ✅ **Infinite memory & sleep-time self-evolution**
-5. ⏳ Mobile PWA mission control, phone alerts & one-command installer
+5. ✅ **Mobile PWA mission control, phone alerts & one-command installer**
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full blueprint.

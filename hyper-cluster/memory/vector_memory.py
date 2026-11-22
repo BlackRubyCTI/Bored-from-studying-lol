@@ -41,6 +41,7 @@ from typing import Any
 
 from core.ids import now_s
 from core.logging_setup import get_logger
+from memory.pdf import extract_pdf_text, is_pdf
 
 LOGGER = get_logger("memory.vector_memory")
 
@@ -422,22 +423,44 @@ class VectorMemory:
         return record
 
     def ingest_file(self, path: str | Path, *, name: str = "") -> DocumentRecord | None:
-        """Index a file from disk (text-like formats only)."""
+        """Index a file from disk (text and PDF are supported)."""
         source = Path(path).expanduser()
         if not source.is_file():
             return None
         try:
-            text = source.read_text(encoding="utf-8", errors="replace")
+            payload = source.read_bytes()
         except OSError:
             LOGGER.warning("memory: unreadable file", extra={"hc_path": str(source)})
             return None
+        metadata = {"source_path": str(source), "size": len(payload)}
+        if is_pdf(payload, source.name):
+            text, extra = extract_pdf_text(payload)
+            metadata.update(extra)
+        else:
+            text = payload.decode("utf-8", errors="replace")
         if not text.strip():
             return None
-        return self.add_document(
-            name or source.name,
-            text,
-            metadata={"source_path": str(source), "size": source.stat().st_size},
-        )
+        return self.add_document(name or source.name, text, metadata=metadata)
+
+    def ingest_bytes(
+        self,
+        payload: bytes,
+        name: str = "upload",
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> DocumentRecord | None:
+        """Index an uploaded file (text or PDF)."""
+        if not payload:
+            return None
+        extra_metadata: dict[str, Any] = {"size": len(payload)}
+        if is_pdf(payload, name):
+            text, extra = extract_pdf_text(payload)
+            extra_metadata.update(extra)
+        else:
+            text = payload.decode("utf-8", errors="replace")
+        if not text.strip():
+            return None
+        return self.add_document(name or "upload", text, metadata={**extra_metadata, **(metadata or {})})
 
     def record_exchange(
         self,
