@@ -1,0 +1,13 @@
+# Hyper-Cluster Omega -- core runtime dependencies (milestone 1)
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.7
+httpx>=0.27
+websockets>=12
+python-multipart>=0.0.9
+psutil>=5.9
+pyyaml>=6.0
+
+# Test tooling
+pytest>=8
+pytest-asyncio>=0.23

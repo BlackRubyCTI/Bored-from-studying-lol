@@ -1,0 +1,409 @@
+"""FastAPI control plane for the head node.
+
+Routes
+------
+``GET  /``                      service banner
+``GET  /health``                liveness + coarse cluster health
+``GET  /v1/status``             full telemetry snapshot (dashboard polls this)
+``GET  /v1/workers``            worker inventory
+``POST /v1/workers/register``   worker self-registration (mesh token)
+``POST /v1/workers/{id}/heartbeat``  liveness beacon
+``POST /v1/workers/{id}/drain``  graceful retirement
+``DELETE /v1/workers/{id}``     hard removal
+``POST /v1/chat``               non-streaming completion
+``POST /v1/chat/stream``        Server-Sent Events completion
+``GET  /v1/events``             live telemetry stream (SSE)
+``GET  /v1/models``             model catalogue + active model
+``GET  /v1/requests/{id}``      status (and result) of any request
+``GET  /v1/queue``              hold-and-requeue buffer
+``GET  /v1/credentials``        credential vault snapshot (admin)
+``POST /v1/credentials``        register a provider account (admin)
+"""
+
+from __future__ import annotations
+
+import json
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from core.config import Settings, get_settings
+from core.credentials import Credential, get_vault
+from core.errors import AuthError, HyperClusterError
+from core.ids import now_s
+from core.logging_setup import get_logger, setup_logging
+from core.protocol import (
+    ChatCompletion,
+    ChatRequest,
+    RequestMode,
+    WorkerAck,
+    WorkerHeartbeat,
+    WorkerHello,
+)
+from head_node.events import EventBus
+from head_node.orchestrator import Orchestrator
+from head_node.request_store import RequestLedger
+from head_node.scheduler import Scheduler
+from head_node.worker_registry import WorkerRegistry
+
+LOGGER = get_logger("head_node.app")
+
+SSE_HEADERS = {
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+
+
+def sse_payload(event: str, data: dict[str, Any]) -> str:
+    """Render one Server-Sent Event frame."""
+    return f"event: {event}\ndata: {json.dumps(data, default=str)}\n\n"
+
+
+def create_app(
+    settings: Settings | None = None,
+    *,
+    orchestrator: Orchestrator | None = None,
+) -> FastAPI:
+    """Build the FastAPI application (factory kept separate for tests)."""
+    resolved = settings or get_settings()
+    setup_logging(resolved.log_level, json_mode=resolved.log_json, log_file=resolved.log_file or None)
+    resolved.ensure_dirs()
+
+    registry = WorkerRegistry(
+        ttl_seconds=resolved.worker_ttl_seconds,
+        max_concurrency_per_worker=resolved.max_concurrency_per_worker,
+    )
+    events = EventBus()
+    ledger = RequestLedger()
+    engine = orchestrator or Orchestrator(
+        resolved,
+        registry=registry,
+        events=events,
+        ledger=ledger,
+    )
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        app.state.settings = resolved
+        app.state.orchestrator = engine
+        app.state.events = events
+        app.state.ledger = ledger
+        await engine.startup()
+        LOGGER.info(
+            "head node ready",
+            extra={
+                "hc_cluster": resolved.cluster_name,
+                "hc_port": resolved.head_port,
+                "hc_instance": resolved.instance_id,
+            },
+        )
+        try:
+            yield
+        finally:
+            await engine.shutdown()
+
+    app = FastAPI(
+        title="Hyper-Cluster Omega",
+        version="1.0.0",
+        description="Zero-limit autonomous AI operating system -- head node control plane.",
+        lifespan=lifespan,
+    )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=resolved.cors_origins or ["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # ------------------------------------------------------------------ #
+    # Authentication
+    # ------------------------------------------------------------------ #
+    async def require_client_auth(
+        authorization: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None),
+    ) -> str:
+        """Authenticate a phone/browser client."""
+        expected = resolved.api_key
+        if not expected:
+            return "anonymous"
+        presented = x_api_key
+        if not presented and authorization and authorization.lower().startswith("bearer "):
+            presented = authorization[7:].strip()
+        if not presented or presented != expected:
+            raise HTTPException(status_code=401, detail="invalid or missing API key")
+        return "client"
+
+    async def require_mesh_auth(
+        authorization: str | None = Header(default=None),
+        x_mesh_token: str | None = Header(default=None),
+    ) -> str:
+        """Authenticate a mesh worker."""
+        expected = resolved.mesh_token
+        if not expected:
+            return "anonymous"
+        presented = x_mesh_token
+        if not presented and authorization and authorization.lower().startswith("bearer "):
+            presented = authorization[7:].strip()
+        if not presented or presented != expected:
+            raise HTTPException(status_code=401, detail="invalid or missing mesh token")
+        return "worker"
+
+    async def require_admin_auth(
+        authorization: str | None = Header(default=None),
+        x_admin_token: str | None = Header(default=None),
+    ) -> str:
+        """Authenticate an administrative call."""
+        expected = resolved.admin_token or resolved.api_key
+        if not expected:
+            return "anonymous"
+        presented = x_admin_token
+        if not presented and authorization and authorization.lower().startswith("bearer "):
+            presented = authorization[7:].strip()
+        if not presented or presented != expected:
+            raise HTTPException(status_code=401, detail="invalid or missing admin token")
+        return "admin"
+
+    # ------------------------------------------------------------------ #
+    # Error handling
+    # ------------------------------------------------------------------ #
+    @app.exception_handler(HyperClusterError)
+    async def hypercluster_error_handler(request: Request, exc: HyperClusterError) -> JSONResponse:
+        LOGGER.warning(
+            "request rejected",
+            extra={"hc_error": exc.code, "hc_message": exc.message, "hc_path": request.url.path},
+        )
+        return JSONResponse(status_code=exc.http_status, content=exc.to_dict())
+
+    # ------------------------------------------------------------------ #
+    # Service level
+    # ------------------------------------------------------------------ #
+    @app.get("/")
+    async def root() -> dict[str, Any]:
+        return {
+            "service": "hyper-cluster-omega",
+            "version": "1.0.0",
+            "cluster": resolved.cluster_name,
+            "instance": resolved.instance_id,
+            "protocol": "1.0",
+            "docs": "/docs",
+            "status": "/v1/status",
+        }
+
+    @app.get("/health")
+    async def health() -> dict[str, Any]:
+        status = engine.status()
+        return {
+            "status": "ok" if status.healthy else "degraded",
+            "ts": now_s(),
+            "workers": status.worker_count,
+            "healthy_workers": status.healthy_workers,
+            "edge": status.edge_healthy,
+            "queued": status.queued_requests,
+        }
+
+    @app.get("/v1/status")
+    async def cluster_status(_: str = Depends(require_client_auth)) -> dict[str, Any]:
+        status = engine.status()
+        payload = status.model_dump(mode="json")
+        payload["hold_queue"] = engine.hold_queue.stats()
+        payload["hold_queue_entries"] = engine.hold_queue.snapshot()
+        payload["edge"] = engine.edge.stats()
+        payload["ledger"] = engine.ledger.stats()
+        payload["settings"] = resolved.redacted()
+        return payload
+
+    # ------------------------------------------------------------------ #
+    # Worker mesh
+    # ------------------------------------------------------------------ #
+    @app.get("/v1/workers")
+    async def list_workers(_: str = Depends(require_client_auth)) -> dict[str, Any]:
+        return {
+            "workers": [record.model_dump(mode="json") for record in engine.registry.snapshot()],
+            "totals": engine.registry.totals(),
+        }
+
+    @app.post("/v1/workers/register", response_model=WorkerAck)
+    async def register_worker(
+        hello: WorkerHello,
+        _: str = Depends(require_mesh_auth),
+    ) -> WorkerAck:
+        record = engine.registry.register(hello)
+        await engine.events.emit(
+            "worker.registered",
+            {
+                "worker_id": record.worker_id,
+                "provider": record.provider,
+                "vram_gb": record.vram_total_gb,
+                "model": record.model_loaded,
+            },
+        )
+        await engine.notify_worker_changed(record.worker_id)
+        return WorkerAck(
+            accepted=True,
+            worker_id=record.worker_id,
+            assigned_worker_id=record.worker_id,
+            ttl_seconds=engine.registry.ttl_seconds,
+            refresh_before_seconds=max(30, engine.registry.ttl_seconds // 4),
+            drain_before_seconds=resolved.handoff_lead_seconds,
+            head_url=f"http://{resolved.head_host}:{resolved.head_port}",
+            message="registered",
+        )
+
+    @app.post("/v1/workers/{worker_id}/heartbeat")
+    async def worker_heartbeat(
+        worker_id: str,
+        beat: WorkerHeartbeat,
+        _: str = Depends(require_mesh_auth),
+    ) -> dict[str, Any]:
+        if beat.worker_id and beat.worker_id != worker_id:
+            raise HTTPException(status_code=400, detail="worker_id mismatch")
+        record = engine.registry.heartbeat(beat)
+        if record is None:
+            raise HTTPException(status_code=404, detail="unknown worker")
+        engine._capacity_event.set()  # noqa: SLF001 - internal wake-up for held requests
+        return {"ok": True, "expires_at": record.expires_at, "seconds_to_expiry": record.seconds_to_expiry}
+
+    @app.post("/v1/workers/{worker_id}/drain")
+    async def drain_worker(worker_id: str, _: str = Depends(require_admin_auth)) -> dict[str, Any]:
+        record = engine.registry.drain(worker_id, reason="admin request")
+        if record is None:
+            raise HTTPException(status_code=404, detail="unknown worker")
+        await engine.client.drain(record)
+        await engine.events.emit("worker.draining", {"worker_id": worker_id})
+        return {"ok": True, "worker_id": worker_id, "draining": True}
+
+    @app.delete("/v1/workers/{worker_id}")
+    async def remove_worker(worker_id: str, _: str = Depends(require_admin_auth)) -> dict[str, Any]:
+        record = engine.registry.remove(worker_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="unknown worker")
+        await engine.events.emit("worker.expired", {"worker_id": worker_id, "reason": "removed"})
+        return {"ok": True, "worker_id": worker_id}
+
+    # ------------------------------------------------------------------ #
+    # Chat
+    # ------------------------------------------------------------------ #
+    @app.post("/v1/chat")
+    async def chat(payload: ChatRequest, _: str = Depends(require_client_auth)):
+        if payload.stream:
+            return StreamingResponse(
+                engine_event_stream(engine, payload),
+                media_type="text/event-stream",
+                headers=SSE_HEADERS,
+            )
+        completion = await engine.submit(payload)
+        status_code = 202 if completion.error == "deferred" else 200
+        return JSONResponse(status_code=status_code, content=completion.model_dump(mode="json"))
+
+    @app.post("/v1/chat/stream")
+    async def chat_stream(payload: ChatRequest, _: str = Depends(require_client_auth)) -> StreamingResponse:
+        return StreamingResponse(
+            engine_event_stream(engine, payload),
+            media_type="text/event-stream",
+            headers=SSE_HEADERS,
+        )
+
+    @app.get("/v1/requests/{request_id}")
+    async def request_status(request_id: str, _: str = Depends(require_client_auth)) -> dict[str, Any]:
+        status = engine.ledger.get(request_id)
+        if status is None:
+            raise HTTPException(status_code=404, detail="unknown request")
+        completion = engine.ledger.result(request_id)
+        payload: dict[str, Any] = {"status": status.model_dump(mode="json")}
+        if completion is not None:
+            payload["result"] = completion.model_dump(mode="json")
+        return payload
+
+    # ------------------------------------------------------------------ #
+    # Telemetry stream
+    # ------------------------------------------------------------------ #
+    @app.get("/v1/events")
+    async def event_stream(_: str = Depends(require_client_auth)) -> StreamingResponse:
+        return StreamingResponse(
+            telemetry_stream(engine),
+            media_type="text/event-stream",
+            headers=SSE_HEADERS,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Models, queue, credentials
+    # ------------------------------------------------------------------ #
+    @app.get("/v1/models")
+    async def models(_: str = Depends(require_client_auth)) -> dict[str, Any]:
+        catalog = engine.scheduler.catalog
+        return {
+            "active_model": engine.scheduler.active_model(),
+            "models": [spec.model_dump(mode="json") for spec in catalog.models],
+            "edge_models": catalog.edge_models,
+        }
+
+    @app.get("/v1/queue")
+    async def queue(_: str = Depends(require_client_auth)) -> dict[str, Any]:
+        return {
+            "stats": engine.hold_queue.stats(),
+            "entries": engine.hold_queue.snapshot(),
+        }
+
+    @app.get("/v1/credentials")
+    async def credentials(_: str = Depends(require_admin_auth)) -> dict[str, Any]:
+        return {"credentials": get_vault(resolved.credential_file).snapshot()}
+
+    @app.post("/v1/credentials")
+    async def add_credential(
+        payload: dict[str, Any],
+        _: str = Depends(require_admin_auth),
+    ) -> dict[str, Any]:
+        try:
+            credential = Credential.from_dict(payload)
+        except HyperClusterError as exc:
+            raise HTTPException(status_code=422, detail=exc.message) from exc
+        if not credential.token:
+            raise HTTPException(status_code=422, detail="token is required")
+        get_vault(resolved.credential_file).add(credential)
+        return {"ok": True, "credential": credential.to_dict(redact=True)}
+
+    return app
+
+
+async def engine_event_stream(engine: Orchestrator, payload: ChatRequest) -> AsyncIterator[str]:
+    """Translate orchestrator events into SSE frames."""
+    try:
+        async for event in engine.stream(payload):
+            yield sse_payload(event.event, event.data)
+    except Exception as exc:  # noqa: BLE001 - never leave the SSE hanging
+        LOGGER.exception("stream failed", extra={"hc_request": payload.request_id})
+        yield sse_payload("error", {"message": str(exc), "type": type(exc).__name__})
+
+
+async def telemetry_stream(engine: Orchestrator) -> AsyncIterator[str]:
+    """Push live cluster telemetry to the dashboard."""
+    queue = await engine.events.subscribe()
+    try:
+        yield sse_payload("hello", {"ts": now_s(), "cluster": engine.settings.cluster_name})
+        while True:
+            try:
+                event = await asyncio_wait(queue, timeout=15.0)
+            except TimeoutError:
+                yield sse_payload("ping", {"ts": now_s()})
+                continue
+            yield sse_payload(event.event, event.data)
+    finally:
+        await engine.events.unsubscribe(queue)
+
+
+async def asyncio_wait(queue: Any, timeout: float) -> Any:
+    """``asyncio.wait_for`` on a queue with a timeout error translation."""
+    import asyncio
+
+    try:
+        return await asyncio.wait_for(queue.get(), timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError from exc
+
+
+__all__ = ["create_app", "sse_payload", "SSE_HEADERS"]
