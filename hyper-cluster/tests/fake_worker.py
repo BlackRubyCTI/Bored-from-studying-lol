@@ -13,8 +13,9 @@ import json
 import socket
 import threading
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator
+from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -177,7 +178,7 @@ class WorkerServer:
     def worker_id(self) -> str:
         return self.state.worker_id
 
-    def start(self, timeout: float = 10.0) -> "WorkerServer":
+    def start(self, timeout: float = 10.0) -> WorkerServer:
         """Start the server and block until it accepts connections."""
         config = uvicorn.Config(
             build_worker_app(self.state),
@@ -210,7 +211,7 @@ class WorkerServer:
         if self._thread is not None:
             self._thread.join(timeout=5.0)
 
-    def __enter__(self) -> "WorkerServer":
+    def __enter__(self) -> WorkerServer:
         return self.start()
 
     def __exit__(self, *exc: Any) -> None:

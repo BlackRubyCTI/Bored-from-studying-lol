@@ -270,10 +270,10 @@ class HoldQueueFull(Exception):
         self.request_id = request_id
 
 
-def _consume_future_exception(future: "asyncio.Future[Any]") -> None:
+def _consume_future_exception(future: asyncio.Future[Any]) -> None:
     """Mark a future's exception as retrieved (nobody may await it)."""
 
-    def _drain(fut: "asyncio.Future[Any]") -> None:
+    def _drain(fut: asyncio.Future[Any]) -> None:
         if not fut.cancelled():
             fut.exception()
 

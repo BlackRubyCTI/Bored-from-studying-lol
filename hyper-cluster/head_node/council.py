@@ -18,8 +18,9 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Sequence
+from typing import Any
 
 from core.config import Settings
 from core.errors import WorkerUnreachableError
@@ -349,7 +350,7 @@ class CouncilEngine:
         # 1. Fan out.
         results = await asyncio.gather(*(self._ask(record, request) for record in chosen), return_exceptions=True)
         members_out: list[CouncilMember] = []
-        for record, result in zip(chosen, results):
+        for record, result in zip(chosen, results, strict=False):
             if isinstance(result, CouncilMember):
                 members_out.append(result)
             else:

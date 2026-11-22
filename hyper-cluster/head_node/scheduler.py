@@ -29,8 +29,9 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 from core.catalog import default_catalog, find_model
 from core.config import Settings

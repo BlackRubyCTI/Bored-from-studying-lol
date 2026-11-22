@@ -269,7 +269,7 @@ class Settings:
 
     # ------------------------------------------------------------------ #
     @classmethod
-    def from_env(cls, env: dict[str, str] | None = None) -> "Settings":
+    def from_env(cls, env: dict[str, str] | None = None) -> Settings:
         """Build settings from an explicit environment mapping."""
         env = dict(os.environ if env is None else env)
 
@@ -339,7 +339,7 @@ class Settings:
         return settings
 
     # ------------------------------------------------------------------ #
-    def with_overrides(self, **overrides: Any) -> "Settings":
+    def with_overrides(self, **overrides: Any) -> Settings:
         """Return a copy of these settings with ``overrides`` applied."""
         data = {f.name: getattr(self, f.name) for f in fields(self)}
         data.update({k: v for k, v in overrides.items() if v is not None})

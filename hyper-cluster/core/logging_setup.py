@@ -19,14 +19,17 @@ import logging
 import os
 import sys
 import threading
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 LOG_FORMAT = "%(asctime)s %(levelname)-8s %(name)s :: %(message)s"
 
 #: Ambient context merged into every record emitted inside the block.
-context_var: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar("hypercluster_log_context", default={})
+context_var: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "hypercluster_log_context", default=None
+)
 
 #: Fields that must never be emitted verbatim.
 _SECRET_HINTS = ("token", "secret", "password", "api_key", "authorization", "cookie")

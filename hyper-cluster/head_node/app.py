@@ -23,8 +23,9 @@ Routes
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,13 +33,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from core.config import Settings, get_settings
 from core.credentials import Credential, get_vault
-from core.errors import AuthError, HyperClusterError
+from core.errors import HyperClusterError
 from core.ids import now_s
 from core.logging_setup import get_logger, setup_logging
 from core.protocol import (
-    ChatCompletion,
     ChatRequest,
-    RequestMode,
     WorkerAck,
     WorkerHeartbeat,
     WorkerHello,
@@ -46,7 +45,6 @@ from core.protocol import (
 from head_node.events import EventBus
 from head_node.orchestrator import Orchestrator
 from head_node.request_store import RequestLedger
-from head_node.scheduler import Scheduler
 from head_node.worker_registry import WorkerRegistry
 
 LOGGER = get_logger("head_node.app")

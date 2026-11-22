@@ -22,19 +22,19 @@ layer turns them into Server-Sent Events for the phone.
 from __future__ import annotations
 
 import asyncio
-import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Iterable
+from typing import Any
 
-from core.config import Settings
 from core.catalog import find_model
+from core.config import Settings
 from core.credentials import CredentialVault, get_vault
 from core.errors import (
     HoldTimeoutError,
     NoCapacityError,
     WorkerUnreachableError,
 )
-from core.ids import mono_ms, new_request_id, now_s
+from core.ids import mono_ms, now_s
 from core.logging_setup import get_logger, log_context
 from core.protocol import (
     ChatCompletion,
@@ -50,7 +50,7 @@ from core.protocol import (
 from head_node.council import CouncilEngine, CouncilOutcome, similarity
 from head_node.edge_bridge import EdgeBridge
 from head_node.events import EventBus
-from head_node.hold_queue import HoldQueue, HoldState
+from head_node.hold_queue import HoldQueue
 from head_node.request_store import RequestLedger
 from head_node.scheduler import Scheduler, SchedulerDecision
 from head_node.worker_client import WorkerClient
@@ -301,8 +301,10 @@ class Orchestrator:
                         "deferred",
                         {
                             "request_id": request.request_id,
-                            "message": "All workers are busy; your request is queued and will be answered "
-                            "automatically. Pull /v1/requests/%s for the result." % request.request_id,
+                            "message": (
+                                "All workers are busy; your request is queued and will be answered "
+                                f"automatically. Pull /v1/requests/{request.request_id} for the result."
+                            ),
                             "reason": str(exc),
                         },
                     )
@@ -737,7 +739,7 @@ class Orchestrator:
         members = self.council.select_members(request)
         if not members:
             if self.settings.hold_enabled:
-                decision = await self._await_capacity(request, stream, self.scheduler.select(request), set())
+                await self._await_capacity(request, stream, self.scheduler.select(request), set())
                 members = self.council.select_members(request)
             if not members:
                 raise NoCapacityError("no workers available for council mode")
@@ -830,7 +832,7 @@ class Orchestrator:
             )
 
 
-def _drain_future(future: "asyncio.Future[Any]") -> None:
+def _drain_future(future: asyncio.Future[Any]) -> None:
     """Retrieve a future's exception so asyncio does not warn about it."""
     if not future.cancelled():
         future.exception()

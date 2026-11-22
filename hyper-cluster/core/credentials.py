@@ -30,10 +30,10 @@ from __future__ import annotations
 import json
 import os
 import threading
-import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from core.errors import CredentialStoreError
 from core.ids import now_s
@@ -126,7 +126,7 @@ class Credential:
         return data
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Credential":
+    def from_dict(cls, data: dict[str, Any]) -> Credential:
         provider = str(data.get("provider", "")).strip().lower()
         if not provider:
             raise CredentialStoreError("credential entry is missing 'provider'")
@@ -164,7 +164,7 @@ class CredentialVault:
     def path(self) -> Path | None:
         return self._path
 
-    def load(self, *, force: bool = False) -> "CredentialVault":
+    def load(self, *, force: bool = False) -> CredentialVault:
         """Load credentials from disk and overlay environment variables."""
         with self._lock:
             if self._loaded and not force:
