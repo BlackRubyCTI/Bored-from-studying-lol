@@ -45,6 +45,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import shlex
 import tempfile
 import time
 from abc import ABC, abstractmethod
@@ -239,23 +240,38 @@ class ComputeProvisioner(ABC):
         """The script the provisioned node runs to join the cluster."""
         model = request.model or ""
         backend = "auto" if model else "simulator"
+        repo_url = request.labels.get("repo_url") or "https://github.com/BlackRubyCTI/Bored-from-studying-lol.git"
+        repo_dir = request.labels.get("repo_dir") or "/tmp/hyper-cluster-repo"
         return "\n".join(
             [
                 "#!/usr/bin/env bash",
                 "# Hyper-Cluster Omega -- headless worker bootstrap (generated).",
                 "set -euo pipefail",
-                f"export HYPER_WORKER_HEAD_URL='{request.head_url}'",
-                f"export HYPER_WORKER_MESH_TOKEN='{request.mesh_token}'",
-                f"export HYPER_WORKER_PROVIDER='{request.provider}'",
-                f"export HYPER_WORKER_REGION='{request.region}'",
-                f"export HYPER_WORKER_MODEL_FILENAME='{model}'",
-                f"export HYPER_WORKER_MODEL_FAMILY='{request.family or ''}'",
-                f"export HYPER_WORKER_TTL_SECONDS='{int(request.ttl_seconds)}'",
-                f"export HYPER_WORKER_BACKEND='{backend}'",
-                "if [ -x ./worker/bootstrap.sh ]; then",
-                "  ./worker/bootstrap.sh --install",
+                f"export HYPER_WORKER_HEAD_URL={shlex.quote(request.head_url)}",
+                f"export HYPER_WORKER_MESH_TOKEN={shlex.quote(request.mesh_token)}",
+                f"export HYPER_WORKER_PROVIDER={shlex.quote(request.provider)}",
+                f"export HYPER_WORKER_REGION={shlex.quote(request.region)}",
+                f"export HYPER_WORKER_MODEL_FILENAME={shlex.quote(model)}",
+                f"export HYPER_WORKER_MODEL_FAMILY={shlex.quote(request.family or '')}",
+                f"export HYPER_WORKER_TTL_SECONDS={shlex.quote(str(int(request.ttl_seconds)))}",
+                f"export HYPER_WORKER_BACKEND={shlex.quote(backend)}",
+                "if [ ! -f ./worker/bootstrap.sh ]; then",
+                f"  REPO_URL={shlex.quote(repo_url)}",
+                f"  REPO_DIR={shlex.quote(repo_dir)}",
+                "  if [ ! -d \"${REPO_DIR}/.git\" ]; then",
+                "    git clone --depth 1 \"${REPO_URL}\" \"${REPO_DIR}\"",
+                "  fi",
+                "  if [ -d \"${REPO_DIR}/hyper-cluster\" ]; then",
+                "    cd \"${REPO_DIR}/hyper-cluster\"",
+                "  else",
+                "    cd \"${REPO_DIR}\"",
+                "  fi",
+                "fi",
+                "if [ -f ./worker/bootstrap.sh ]; then",
+                "  chmod +x ./worker/bootstrap.sh",
+                "  exec bash ./worker/bootstrap.sh --install",
                 "else",
-                "  echo 'worker/bootstrap.sh is missing from the payload' >&2",
+                "  echo 'worker/bootstrap.sh is missing from the payload and cloned repo' >&2",
                 "  exit 1",
                 "fi",
             ]
@@ -670,30 +686,32 @@ class OracleProvisioner(ComputeProvisioner):
                 ),
             )
         ssh_keys = metadata.get("ssh_public_key") or ""
+        subnet_id = metadata.get("subnet_id") or ""
         cloud_init = "\n".join(
             [
                 "#!/bin/bash",
-                "apt-get update && apt-get install -y python3 python3-pip curl ca-certificates git",
+                "apt-get update && apt-get install -y python3 python3-pip python3-venv curl ca-certificates git",
                 "mkdir -p /opt/hypercluster && cd /opt/hypercluster",
                 "git clone https://github.com/BlackRubyCTI/Bored-from-studying-lol.git repo || true",
                 "cd repo/hyper-cluster 2>/dev/null || cd /opt/hypercluster/repo/hyper-cluster",
                 self._worker_bootstrap(request),
             ]
         )
-        body = json.dumps(
-            {
-                "compartmentId": compartment,
-                "availabilityDomain": availability,
-                "displayName": f"hyper-cluster-{request.region}",
-                "shape": "VM.Standard.A1.Flex",
-                "shapeConfig": {"ocpus": 4, "memoryInGBs": 24},
-                "sourceDetails": {"sourceType": "image", "imageId": image},
-                "metadata": {
-                    "ssh_authorized_keys": ssh_keys,
-                    "user_data": base64.b64encode(cloud_init.encode("utf-8")).decode("ascii"),
-                },
-            }
-        ).encode("utf-8")
+        instance_payload: dict[str, Any] = {
+            "compartmentId": compartment,
+            "availabilityDomain": availability,
+            "displayName": f"hyper-cluster-{request.region}",
+            "shape": "VM.Standard.A1.Flex",
+            "shapeConfig": {"ocpus": 4, "memoryInGBs": 24},
+            "sourceDetails": {"sourceType": "image", "imageId": image},
+            "metadata": {
+                "ssh_authorized_keys": ssh_keys,
+                "user_data": base64.b64encode(cloud_init.encode("utf-8")).decode("ascii"),
+            },
+        }
+        if subnet_id:
+            instance_payload["createVnicDetails"] = {"subnetId": subnet_id, "assignPublicIp": True}
+        body = json.dumps(instance_payload).encode("utf-8")
         url = f"{self._region_host(request)}/20160918/instances"
         try:
             headers = self._signed_headers(credential, "POST", url, body)

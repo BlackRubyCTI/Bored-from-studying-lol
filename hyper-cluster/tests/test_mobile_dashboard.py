@@ -127,6 +127,15 @@ def test_the_api_key_is_required_when_the_cluster_has_one(tmp_path: Path) -> Non
         assert ok.status_code == 200
 
 
+def test_the_pwa_wires_admin_token_and_sse_error_and_deferred(dashboard: TestClient) -> None:
+    html = dashboard.get("/").text
+    js = dashboard.get("/app.js").text
+    assert 'id="set-admin"' in html
+    assert 'x-admin-token' in js
+    assert 'kind === "deferred"' in js
+    assert "data.message || data.error" in js
+
+
 # --------------------------------------------------------------------------- #
 # The streaming
 # --------------------------------------------------------------------------- #
