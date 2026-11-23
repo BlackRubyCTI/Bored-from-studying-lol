@@ -179,6 +179,29 @@ class HoldQueue:
             entry.attempts += 1
             return entry
 
+    def assign(self, request_id: str, worker_id: str) -> HeldRequest | None:
+        """Take a waiting entry out of the buffer and hand it to a worker.
+
+        Unlike :meth:`claim` -- which keeps the entry in the buffer so the
+        deferred pool can still see it -- an assigned request is no longer
+        waiting for capacity.  It is removed from the buffer, so the queue
+        depth and the ``/v1/status`` counters stay honest and the request can
+        not be replayed a second time.
+        """
+        with self._lock:
+            entry = self._entries.get(request_id)
+            if entry is None or entry.state is not HoldState.WAITING:
+                return None
+            entry.state = HoldState.ASSIGNED
+            entry.worker_id = worker_id
+            entry.attempts += 1
+            self._entries.pop(request_id, None)
+        LOGGER.info(
+            "held request assigned to a worker",
+            extra={"hc_request": request_id, "hc_worker": worker_id},
+        )
+        return entry
+
     def complete(self, request_id: str, completion: ChatCompletion) -> HeldRequest | None:
         """Resolve a parked request with a successful result."""
         with self._lock:

@@ -252,3 +252,22 @@ def test_hold_queue_snapshot_reports_position() -> None:
     snapshot = queue.snapshot()
     assert len(snapshot) == 1
     assert snapshot[0]["state"] == "waiting"
+
+
+@pytest.mark.asyncio
+async def test_hold_queue_assign_removes_the_entry_from_the_buffer() -> None:
+    """An assigned request no longer waits for capacity (it must not linger)."""
+    queue = HoldQueue(max_size=8, ttl_seconds=30)
+    request = _request()
+    queue.enqueue(request)
+    assert queue.waiting_count() == 1
+    entry = queue.assign(request.request_id, "wk-a")
+    assert entry is not None
+    assert entry.state is HoldState.ASSIGNED
+    assert entry.worker_id == "wk-a"
+    assert queue.waiting_count() == 0
+    assert len(queue) == 0
+    assert queue.get(request.request_id) is None
+    # A second assignment (or a replay) must not see it any more.
+    assert queue.assign(request.request_id, "wk-b") is None
+    assert queue.deferred_count() == 0

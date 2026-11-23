@@ -48,7 +48,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "name": "python",
             "description": (
                 "Execute Python 3 code in an isolated sandbox and return stdout/stderr. "
-                "No network access, no subprocesses, hard CPU/memory limits."
+                "No network access, no subprocesses, hard CPU/memory limits, and the "
+                "filesystem is limited to the workspace plus read-only system libraries."
             ),
             "parameters": {
                 "type": "object",
@@ -309,10 +310,116 @@ def _split_last_expression(source):
     return statements, expression
 
 
+def _install_path_guard():
+    """Confine file access to the sandbox workspace.
+
+    The process guards stop ``subprocess``/``os.system``, but plain ``open()``
+    would still read the head node's ``.env`` (every API key) or write into the
+    host filesystem.  Every path-opening builtin is therefore routed through a
+    check: only the workspace, the system's read-only library paths and
+    ``/dev/null``-style devices stay reachable.  Writes are allowed *inside the
+    workspace only*.
+    """
+    workspace = os.path.realpath(str(CONFIG.get("workspace") or os.getcwd()))
+    readable_roots = [workspace]
+    for prefix in ("/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc/ssl", "/etc/localtime", "/proc/self", "/dev"):
+        readable_roots.append(prefix)
+    for prefix in (sys.prefix, sys.base_prefix):
+        readable_roots.append(prefix)
+    writable_roots = [workspace]
+    devices = ("/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom", "/dev/stdout", "/dev/stderr")
+
+    def _under(path, roots):
+        for root in roots:
+            if path == root or path.startswith(root.rstrip("/") + "/"):
+                return True
+        return False
+
+    def _check(file, mode):
+        if isinstance(file, int):
+            return  # an already-open descriptor (never created by user code)
+        try:
+            raw = os.fspath(file)
+        except TypeError:
+            return
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        target = os.path.realpath(os.path.join(workspace, raw))
+        writing = any(flag in mode for flag in ("w", "a", "x", "+"))
+        if writing:
+            if not _under(target, writable_roots):
+                raise PermissionError("the sandbox only writes inside its workspace (%s)" % target)
+            return
+        if target in devices:
+            return
+        if _under(target, readable_roots):
+            return
+        raise PermissionError("the sandbox cannot read %s (outside its workspace)" % target)
+
+    real_open = builtins.open
+    real_io_open = io.open
+
+    def guarded_open(file, mode="r", *args, **kwargs):
+        _check(file, mode)
+        return real_open(file, mode, *args, **kwargs)
+
+    def guarded_io_open(file, mode="r", *args, **kwargs):
+        _check(file, mode)
+        return real_io_open(file, mode, *args, **kwargs)
+
+    builtins.open = guarded_open
+    io.open = guarded_io_open
+    os.open = guarded_open
+
+    real_listdir, real_scandir, real_stat = os.listdir, os.scandir, os.stat
+    real_path_exists, real_is_file, real_is_dir = os.path.exists, os.path.isfile, os.path.isdir
+
+    def guarded_listdir(path="."):
+        _check(path, "r")
+        return real_listdir(path)
+
+    def guarded_scandir(path="."):
+        _check(path, "r")
+        return real_scandir(path)
+
+    def guarded_stat(path, *args, **kwargs):
+        _check(path, "r")
+        return real_stat(path, *args, **kwargs)
+
+    def guarded_exists(path):
+        try:
+            _check(path, "r")
+        except PermissionError:
+            return False
+        return real_path_exists(path)
+
+    def guarded_isfile(path):
+        try:
+            _check(path, "r")
+        except PermissionError:
+            return False
+        return real_is_file(path)
+
+    def guarded_isdir(path):
+        try:
+            _check(path, "r")
+        except PermissionError:
+            return False
+        return real_is_dir(path)
+
+    os.listdir = guarded_listdir
+    os.scandir = guarded_scandir
+    os.stat = guarded_stat
+    os.path.exists = guarded_exists
+    os.path.isfile = guarded_isfile
+    os.path.isdir = guarded_isdir
+
+
 def main():
     _apply_limits()
     _install_network_guard()
     _install_process_guard()
+    _install_path_guard()
 
     source = ""
     try:
@@ -408,6 +515,7 @@ class PythonSandbox:
                 "open_files": self.open_files,
                 "processes": self.processes,
                 "allowed_hosts": self.allowed_hosts,
+                "workspace": str(tmp_path),
                 "max_output": self.max_output_chars,
             }
             env = {

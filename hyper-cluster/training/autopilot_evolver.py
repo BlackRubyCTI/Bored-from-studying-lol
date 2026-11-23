@@ -167,6 +167,19 @@ class AutopilotEvolver:
         return max(5.0, float(getattr(self.settings, "evolution_idle_seconds", 300)))
 
     @property
+    def cooldown_seconds(self) -> float:
+        """How long the cluster stays quiet after a cycle before learning again.
+
+        Without a cooldown the engine would start learning again the instant a
+        cycle finished (idle time was never reset), so on an idle cluster it
+        burned CPU back to back forever instead of sleeping.
+        """
+        configured = getattr(self.settings, "evolution_cooldown_seconds", None)
+        if configured is not None:
+            return max(0.0, float(configured))
+        return self.idle_seconds
+
+    @property
     def preempt_budget_seconds(self) -> float:
         return max(0.1, float(getattr(self.settings, "evolution_preempt_budget_seconds", 2.0)))
 
@@ -214,7 +227,7 @@ class AutopilotEvolver:
                 if self.state == STATE_TRAINING:
                     continue
                 idle_for = now_s() - self.last_activity
-                if idle_for < self.idle_seconds:
+                if idle_for < self.cooldown_seconds:
                     # A preemption is *sticky*: the phone has to be able to
                     # see that the user won (the next cycle resets it).
                     if self.state != STATE_PREEMPTED:
@@ -296,6 +309,9 @@ class AutopilotEvolver:
                 LOGGER.exception("evolution cycle failed")
             report.duration_ms = mono_ms() - started
             self.phase = "idle"
+            # A finished cycle counts as activity: the next one may not start
+            # until the cluster has been quiet for ``cooldown_seconds`` again.
+            self.last_activity = now_s()
             if report.preempted:
                 report.preempt_latency_ms = self._measure_preemption()
                 self.state = STATE_PREEMPTED

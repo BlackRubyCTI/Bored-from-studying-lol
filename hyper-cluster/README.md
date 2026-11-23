@@ -249,7 +249,7 @@ Everything is environment driven (`HYPER_*` prefix for the control plane,
 | `HYPER_MEMORY_ENABLED` / `HYPER_MEMORY_DIR` | the persistent memory on/off and where it lives |
 | `HYPER_DRIVE_FOLDER` / `HYPER_HUB_REPO` | where the memory snapshots and the checkpoints are mirrored |
 | `HYPER_DRIVE_TOKEN` / `HYPER_HUB_TOKEN` | credentials for the Drive / Hub sync |
-| `HYPER_EVOLUTION_ENABLED` / `_IDLE_SECONDS` | the sleep-time engine and how long the cluster must be idle |
+| `HYPER_EVOLUTION_ENABLED` / `_IDLE_SECONDS` / `_COOLDOWN_SECONDS` | the sleep-time engine, how long the cluster must be idle, and the gap between two cycles |
 | `HYPER_EVOLUTION_PREEMPT_BUDGET_SECONDS` | the preemption budget (default 2 s) |
 | `HYPER_EVOLUTION_DATASET_SIZE` / `_TRAIN_STEPS` / `_MAX_SHARDS` | how much the cluster learns per idle window |
 

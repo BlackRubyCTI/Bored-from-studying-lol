@@ -992,7 +992,11 @@ class Orchestrator:
         try:
             while True:
                 fresh = self.scheduler.select(request, mode=request.mode, exclude=excluded)
-                if fresh.has_capacity:
+                if fresh.has_capacity and fresh.primary is not None:
+                    # The request leaves the buffer as soon as it has a home:
+                    # otherwise the queue depth grows without bound and stale
+                    # "waiting" entries would be counted (and replayed) later.
+                    self.hold_queue.assign(entry.request_id, fresh.primary.worker_id)
                     if stream is not None:
                         await stream.emit(
                             "resume",

@@ -195,3 +195,26 @@ async def test_status_reflects_workers_and_queue(
     assert status.healthy_workers == 1
     assert status.total_vram_gb == 24.0
     assert status.cluster_name == orchestrator.settings.cluster_name
+
+
+async def test_held_requests_leave_the_queue_once_they_are_served(
+    orchestrator: Orchestrator, worker_a: WorkerServer
+) -> None:
+    """Regression: a resumed request must not stay in the hold buffer.
+
+    Before the fix the buffer was never drained, so ``waiting``/``held``
+    counters grew forever and the same request could be replayed twice.
+    """
+    orchestrator.registry.register(make_hello("wk-a", worker_a.port))
+    worker_a.state.delay_ms = 60.0
+    try:
+        requests = [_request(f"burst {index}", RequestMode.DEEP) for index in range(6)]
+        completions = await asyncio.gather(*(orchestrator.submit(request) for request in requests))
+        assert all(completion.error is None for completion in completions)
+        assert orchestrator.hold_queue.waiting_count() == 0
+        assert len(orchestrator.hold_queue) == 0
+        status = orchestrator.status()
+        assert status.queued_requests == 0
+        assert status.held_requests == 0
+    finally:
+        worker_a.state.delay_ms = 1.0
