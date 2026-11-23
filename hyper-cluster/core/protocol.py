@@ -342,6 +342,13 @@ class WorkerSnapshot(StrictModel):
     healthy: bool = False
     compute_tflops: float = 0.0
     supported_families: list[str] = Field(default_factory=list)
+    #: The inference backend the worker actually runs (``llama.cpp`` /
+    #: ``upstream`` / ``simulator`` / ``unknown``).  Reported, never guessed:
+    #: a worker that does not say is ``unknown``, not ``llama.cpp``.
+    backend: str = "unknown"
+    #: Concurrency slots this worker advertises (>=1); the basis of the
+    #: "virtual cores" abstraction, so it is reported rather than assumed.
+    max_concurrency: int = 1
 
 
 class ClusterStatus(StrictModel):
@@ -366,6 +373,13 @@ class ClusterStatus(StrictModel):
     edge_providers: list[str] = Field(default_factory=list)
     edge_healthy: list[str] = Field(default_factory=list)
     workers: list[WorkerSnapshot] = Field(default_factory=list)
+    #: True only when at least one healthy source produces real model output
+    #: (a ``llama.cpp``/``upstream`` worker or a healthy edge provider).  When
+    #: every worker is the deterministic simulator this is ``False`` and the
+    #: API/PWA must say so loudly instead of implying model-grade answers.
+    answers_are_real: bool = False
+    #: Distinct backends currently serving (e.g. ``["simulator"]``).
+    backends: list[str] = Field(default_factory=list)
     mode: RequestMode = RequestMode.AUTO
     autopilot: bool = False
     uptime_seconds: float = 0.0

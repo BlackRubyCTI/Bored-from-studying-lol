@@ -61,7 +61,12 @@ def test_sandbox_blocks_network(sandbox: PythonSandbox) -> None:
         "s.connect(('1.1.1.1', 80))\n"
     )
     assert result.ok is False
-    assert "network" in result.error.lower() or "blocked" in result.error.lower()
+    # The denial may come from the in-process guard ("network ... blocked") or,
+    # under the M6 kernel jail, from seccomp/the empty network namespace
+    # ("Operation not permitted").  Either is a pass: what must never happen is
+    # a successful connect.
+    message = (result.error + result.stderr).lower()
+    assert "network" in message or "blocked" in message or "not permitted" in message
 
 
 def test_sandbox_blocks_dns(sandbox: PythonSandbox) -> None:

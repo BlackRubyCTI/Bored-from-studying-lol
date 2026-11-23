@@ -20,7 +20,10 @@
     voices: [],
     recognition: null,
     listening: false,
-    streaming: false
+    streaming: false,
+    // Capability truth, refreshed from /v1/status on every telemetry poll.
+    answersAreReal: false,
+    backends: []
   };
 
   // ── helpers ──────────────────────────────────────────────────────────
@@ -272,6 +275,7 @@
       $("m-model").textContent = (data.active_model || "—").split("/").pop();
       $("m-queue").textContent = data.queued_requests || 0;
       $("cluster-name").textContent = data.cluster_name || "omega";
+      applyCapability(data.capability, data.answers_are_real, data.backends);
       var dot = $("health-dot");
       dot.className = "dot " + (data.healthy ? "dot-on" : "dot-warn");
       if (typeof data.autopilot === "boolean" && !state.streaming) {
@@ -282,6 +286,25 @@
       $("health-dot").className = "dot dot-off";
       status("cluster unreachable: " + err.message);
     });
+  }
+
+  // Capability truth: the badge must never imply model-grade answers when the
+  // only backend behind the cluster is the deterministic simulator.
+  function applyCapability(capability, answersAreReal, backends) {
+    var label = (capability && capability.label) ||
+      (answersAreReal ? "live model" : "simulator");
+    var real = typeof answersAreReal === "boolean" ? answersAreReal :
+      Boolean(capability && capability.answers_are_real);
+    var node = $("m-capability");
+    var text = $("m-capability-label");
+    if (!node || !text) return;
+    text.textContent = real ? "live model" : "simulator — not model output";
+    node.className = "capability " + (real ? "capability-live" : "capability-simulator");
+    node.title = (capability && capability.detail) ||
+      (real ? "Real model inference is serving." : "Answers come from the deterministic simulator.");
+    node.setAttribute("aria-label", text.textContent + (real ? "" : " (simulated answers)"));
+    state.answersAreReal = real;
+    state.backends = backends || (capability && capability.backends) || [];
   }
 
   function setSwitch(node, on) {

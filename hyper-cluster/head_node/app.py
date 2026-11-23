@@ -43,7 +43,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from core.config import Settings, get_settings
 from core.credentials import Credential, get_vault
-from core.errors import HyperClusterError
+from core.errors import HyperClusterError, PublicURLUnsetError
 from core.ids import now_s
 from core.logging_setup import get_logger, setup_logging
 from core.protocol import (
@@ -94,6 +94,8 @@ def create_app(
         sandbox=PythonSandbox(
             timeout=resolved.sandbox_timeout_seconds,
             memory_limit_mb=resolved.sandbox_memory_limit_mb,
+            isolation=resolved.sandbox_isolation,
+            seccomp=resolved.sandbox_seccomp,
         ),
     ) if resolved.sandbox_enabled else None
     engine = orchestrator or Orchestrator(
@@ -224,8 +226,27 @@ def create_app(
             "queued": status.queued_requests,
         }
 
+    def _best_effort_head_url() -> str:
+        """A routable head URL if we know one, else a clearly-labelled placeholder.
+
+        Registration must never fail because of a cosmetic field (law L1), so
+        this is the one place we tolerate an unroutable guess — and we say so.
+        """
+        try:
+            return resolved.public_head_url()
+        except PublicURLUnsetError:
+            LOGGER.warning("no routable head URL configured; advertising an unroutable placeholder")
+            return f"http://{resolved.head_host}:{resolved.head_port}"
+
     @app.get("/v1/status")
     async def cluster_status(_: str = Depends(require_client_auth)) -> dict[str, Any]:
+        """Cluster truth: what is serving, on which backend, and whether it is real.
+
+        ``answers_are_real`` is the single field the PWA keys its badge off.  It
+        is ``False`` whenever the only thing behind the cluster is the
+        deterministic simulator — the API never implies model-grade output it
+        cannot produce.
+        """
         status = engine.status()
         payload = status.model_dump(mode="json")
         payload["hold_queue"] = engine.hold_queue.stats()
@@ -233,7 +254,90 @@ def create_app(
         payload["edge"] = engine.edge.stats()
         payload["ledger"] = engine.ledger.stats()
         payload["settings"] = resolved.redacted()
+        payload["capability"] = {
+            "answers_are_real": status.answers_are_real,
+            "backends": list(status.backends),
+            "simulator_only": not status.answers_are_real,
+            "label": "live model" if status.answers_are_real else "simulator",
+            "detail": (
+                "Real model inference is serving."
+                if status.answers_are_real
+                else "The cluster is answering with the deterministic simulator. "
+                "Answers are structurally valid but are NOT model output. "
+                "Load a model on a worker (HYPER_WORKER_MODEL_FILENAME + backend "
+                "llama.cpp/upstream, or an edge provider) to make this real."
+            ),
+        }
         return payload
+
+    @app.get("/v1/capacity/plan")
+    async def capacity_plan(_: str = Depends(require_client_auth)) -> dict[str, Any]:
+        """What this cluster can honestly promise right now (M6).
+
+        Derived only from measured state: registered workers, their advertised
+        VRAM and tokens/sec, and the queue.  When the answering backend is the
+        simulator we still report the *mechanical* capacity (slots, VRAM) but
+        explicitly refuse to attach a model-grade throughput claim to it.
+        """
+        status = engine.status()
+        totals = engine.registry.totals()
+        workers = engine.registry.snapshot()
+        measured_tps = float(totals.get("tokens_per_sec", 0.0) or 0.0)
+        slots = 0
+        per_worker: list[dict[str, Any]] = []
+        for worker in workers:
+            usable = worker.healthy and not worker.draining
+            if usable:
+                slots += worker.max_concurrency
+            per_worker.append(
+                {
+                    "worker_id": worker.worker_id,
+                    "backend": worker.backend,
+                    "healthy": worker.healthy,
+                    "draining": worker.draining,
+                    "vram_free_gb": round(worker.vram_free_gb, 2),
+                    "tokens_per_sec": round(worker.tokens_per_sec, 2),
+                    "max_concurrency": worker.max_concurrency,
+                    "model": worker.model_loaded,
+                }
+            )
+        real = status.answers_are_real
+        plan: dict[str, Any] = {
+            "ts": now_s(),
+            "answers_are_real": real,
+            "backends": list(status.backends),
+            "workers": per_worker,
+            "virtual_vram_gb": {
+                "total": round(float(totals.get("total_vram_gb", 0.0) or 0.0), 2),
+                "free": round(float(totals.get("free_vram_gb", 0.0) or 0.0), 2),
+            },
+            "virtual_cores": {
+                "concurrent_slots": slots,
+                "method": "sum of each healthy, non-draining worker's advertised max_concurrency",
+            },
+            "measured_tokens_per_sec": round(measured_tps, 2),
+            "queued_requests": status.queued_requests,
+            "active_model": status.active_model,
+        }
+        if real and measured_tps > 0 and status.active_model:
+            # A claim is only made from a measurement.
+            plan["claim"] = {
+                "model": status.active_model,
+                "concurrent_slots": slots,
+                "tokens_per_sec_aggregate": round(measured_tps, 2),
+                "method": "sum of worker-reported tokens/sec over healthy workers",
+            }
+            plan["model_grade"] = True
+        else:
+            plan["claim"] = None
+            plan["model_grade"] = False
+            plan["why_no_claim"] = (
+                "No measurement behind a model-grade claim: the answering backend is "
+                f"{', '.join(status.backends) or 'none'} and aggregate tokens/sec is "
+                f"{measured_tps:.2f}. Capacity numbers above are mechanical "
+                "(slots, VRAM) only."
+            )
+        return plan
 
     # ------------------------------------------------------------------ #
     # Worker mesh
@@ -268,7 +372,9 @@ def create_app(
             ttl_seconds=engine.registry.ttl_seconds,
             refresh_before_seconds=max(30, engine.registry.ttl_seconds // 4),
             drain_before_seconds=resolved.handoff_lead_seconds,
-            head_url=f"http://{resolved.head_host}:{resolved.head_port}",
+            # A worker that is already checking in can keep using the URL it
+            # reached us on; only fall back to one we can actually route.
+            head_url=_best_effort_head_url(),
             message="registered",
         )
 
@@ -444,7 +550,16 @@ def create_app(
         payload: dict[str, Any],
         _: str = Depends(require_admin_auth),
     ) -> dict[str, Any]:
-        """Provision compute on demand (multi-account failover)."""
+        """Provision compute on demand (multi-account failover).
+
+        Refuses before touching a provider when no routable head URL is known:
+        a node provisioned with ``http://0.0.0.0:8080`` burns quota and never
+        checks in, which is exactly the silent failure M6 exists to kill.
+        """
+        try:
+            head_url = resolved.public_head_url()
+        except PublicURLUnsetError as exc:
+            raise HTTPException(status_code=exc.http_status, detail=exc.to_dict()) from exc
         request = SpawnRequest(
             provider=str(payload.get("provider") or ""),
             region=str(payload.get("region") or "unknown"),
@@ -454,8 +569,7 @@ def create_app(
             vram_gb=float(payload.get("vram_gb") or 0.0),
             ttl_seconds=int(payload.get("ttl_seconds") or resolved.spawner_default_ttl_seconds),
             labels={str(k): str(v) for k, v in (payload.get("labels") or {}).items()},
-            head_url=resolved.public_base_url
-            or f"http://{resolved.head_host}:{resolved.head_port}",
+            head_url=head_url,
             mesh_token=resolved.mesh_token,
         )
         result = await engine.spawner.provision(request)

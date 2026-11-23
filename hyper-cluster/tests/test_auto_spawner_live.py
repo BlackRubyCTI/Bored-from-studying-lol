@@ -180,6 +180,11 @@ def settings(tmp_path) -> Settings:
         spawner_min_workers=0,
         spawner_tick_seconds=1,
         handoff_lead_seconds=600,
+        # A routable head URL is a precondition for provisioning anything: the
+        # default head_host is 0.0.0.0 (a bind address) and M6 refuses to hand
+        # that to a remote node.  The *refusal* has its own dedicated test in
+        # tests/test_m6_truth_and_jail.py.
+        public_base_url="https://head.example.test",
     )
 
 

@@ -77,6 +77,7 @@
 | **3 — Headless API compute spawner & VRAM auto-scaler** | `head_node/{auto_spawner.py,model_selector.py}` | ✅ **complete** |
 | **4 — Infinite memory & sleep-time self-evolution** | `memory/{vector_memory,sync}.py`, `training/{autopilot_evolver,self_play,synthetic_data,prompt_evolver,distributed_trainer,checkpoint_streamer,qlora}.py`, `worker/brain.py` | ✅ **complete** |
 | **5 — Mobile PWA mission control, phone alerts, one-command installer** | `mobile/{dashboard.py,cli.py,notifier.py,qr.py}`, `mobile/static/*`, `memory/pdf.py`, `install_all.sh` | ✅ **complete** |
+| **6 — Truth, hygiene and a real jail** | `tools/jail.py`, `tools/sandbox.py`, `core/{config,errors,protocol}.py`, `worker/bootstrap.sh`, `worker/config.py`, `head_node/{auto_spawner,worker_registry,orchestrator,app}.py` | ✅ **complete** |
 
 ---
 
@@ -603,6 +604,117 @@ It is idempotent: a second run only refreshes what is missing.
 
 ---
 
+## 6b. Milestone 6 — truth, hygiene and a real jail (implemented)
+
+M6 is a *correctness* milestone: it removes four ways the system could lie to its
+operator, and replaces one pretend boundary with a real one.
+
+### 6b.1 One canonical model name
+
+Before M6, `auto_spawner._worker_bootstrap` exported
+`HYPER_WORKER_MODEL_FILENAME` while `worker/bootstrap.sh` read only
+`HYPER_WORKER_MODEL_FILE`.  A spawned node therefore fell through to the
+hard-coded default and silently downloaded a **7B** model whatever the planner
+asked for.
+
+```
+spawner  →  HYPER_WORKER_MODEL_FILENAME=llama-3.2-3b-...gguf     (M6: + _FILE, + _REPO, + _PARAMS_B)
+bootstrap→  MODEL_FILE="${HYPER_WORKER_MODEL_FILENAME:-${HYPER_WORKER_MODEL_FILE:-}}"
+config   →  model_filename = first non-empty of (MODEL_FILENAME, MODEL_FILE)
+```
+
+`select_model()` now has three explicit outcomes instead of one silent fallback:
+
+| Situation | Behaviour |
+|---|---|
+| a model **and** a repo are set | load exactly that model |
+| a model is set but no repo | **refuse to start** (`die`) — never substitute |
+| `HYPER_WORKER_BACKEND=simulator` | download **no** weights at all |
+| nothing set at all | use the default 7B **and log it loudly** |
+
+### 6b.2 A routable head URL, or no provisioning
+
+`Settings.public_head_url()` is the single source of truth for the URL a remote
+node must call back on.  `0.0.0.0`, `::`, `*` and the empty string are **bind**
+addresses, never destinations: they now raise `PublicURLUnsetError`
+(HTTP 409 — an operator precondition, so it never becomes a user-visible 5xx).
+
+Refusal happens in three places, all before a provider is called:
+
+* `AutoSpawner._head_url_or_error()` → used by TTL rotation and scale-out
+  (`tick` refuses the whole round and records one `ok=False` action);
+* `AutoSpawner._provision_replacement()` → returns a `SpawnResult` with
+  `meta.error_code = "public_base_url_unset"`;
+* `POST /v1/spawner/provision` → raises HTTP 409 with the same actionable body.
+
+The one deliberate exception is the worker-registration **ack**: a worker that is
+already talking to us must never fail registration over a cosmetic field, so that
+field falls back to a clearly-labelled placeholder and logs a warning.
+
+### 6b.3 Capability truth
+
+The protocol gained two honest fields:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `WorkerSnapshot.backend` | `str = "unknown"` | what the worker *reports* it runs; never guessed |
+| `WorkerSnapshot.max_concurrency` | `int = 1` | advertised concurrency slots (the basis of "virtual cores") |
+| `ClusterStatus.answers_are_real` | `bool = False` | true only with a healthy `llama.cpp`/`upstream`/`vllm` worker or a healthy edge provider |
+| `ClusterStatus.backends` | `list[str]` | the distinct backends currently serving |
+
+`/v1/status` additionally carries a `capability` block (`label`, `detail`,
+`simulator_only`) which is what the PWA badge binds to.  The default value of
+`answers_are_real` is `False`, so a code path that forgets to decide fails
+**honest**, not optimistic.
+
+`GET /v1/capacity/plan` reports:
+
+* `virtual_vram_gb` — summed from measured worker VRAM;
+* `virtual_cores.concurrent_slots` — summed advertised `max_concurrency` of
+  healthy, non-draining workers (with the method stated);
+* `measured_tokens_per_sec` — the registry's measured aggregate;
+* `claim` — **only** populated when `answers_are_real` *and* aggregate tok/s > 0
+  *and* a model is active; otherwise `null`, with `why_no_claim` explaining what
+  is missing.
+
+### 6b.4 The jail
+
+`tools/jail.py` provides a tiered, probed isolation layer:
+
+```
+container (nsjail)  →  bwrap  →  unshare  →  process
+```
+
+Tiers are *probed*, not assumed (`unshare -Urmpfn --kill-child true`), and the
+tier that actually ran is reported as `sandbox_isolation` on every
+`SandboxResult`, alongside `read_only_root` and `isolation_notes`.
+
+The `unshare` tier mounts:
+
+1. a tmpfs at `/tmp`, into which the untrusted workspace is bind-mounted at
+   `/tmp/.hc-work` **before** the parent is hidden;
+2. size-1M mode-000 tmpfs masks over `/home`, `/root`, `/var/tmp`, `/dev/shm`,
+   `/mnt`, `/media`, `/srv`;
+3. a locked `remount,ro,bind /` read-only root where the kernel permits it;
+4. a fresh `/proc` with only the jail's own PID visible.
+
+Then the **runner** installs a seccomp BPF denylist as its first action, before
+any untrusted code and before the monkeypatched guards:
+
+```
+execve, execveat, socket, mount, umount2, pivot_root, chroot, ptrace,
+process_vm_readv, process_vm_writev, bpf, perf_event_open, kexec_load,
+init_module, finit_module, delete_module, unshare, setns, reboot,
+swapon, swapoff, add_key, request_key, keyctl        → EPERM
+```
+
+The filter is installed by the runner rather than the jail script because the
+jail script must still `execve` the interpreter itself.  The monkeypatched path
+guards remain as defence in depth, and `guards_off=True` exists so the test
+suite can prove the **kernel** boundary alone.
+
+---
+
 ## 7. Repository layout
 
 ```
@@ -616,7 +728,8 @@ hyper-cluster/
 │   ├── mesh.py              Tailscale automation
 │   ├── brain.py             the hot-reloadable LoRA brain
 │   └── bootstrap.sh         zero-touch provisioning
-├── tools/                   tool-use sandbox (M2 ✅)
+├── tools/                   tool-use sandbox (M2 ✅, M6 ✅)
+│   ├── jail.py              tiered kernel isolation: namespaces, seccomp, RO root
 │   └── sandbox.py           python isolation, web, files, tool protocol
 ├── memory/                  vector memory   (M4 ✅, M5 ✅)
 │   ├── vector_memory.py     store, hybrid retrieval, facts, snapshots
@@ -637,7 +750,7 @@ hyper-cluster/
 │   ├── qr.py                the dependency-free QR encoder
 │   └── static/              the shell (HTML, CSS, JS, manifest, service worker, icon)
 ├── tests/                   live test-suite (331 tests, real HTTP + SSE)
-├── scripts/                 smoke harnesses (M1 + M2 + M3 + M4 + M5)
+├── scripts/                 smoke harnesses (M1..M6)
 ├── install_all.sh           the one-command installer (M5 ✅)
 ├── .env.example             configuration template
 ├── ARCHITECTURE.md          this document

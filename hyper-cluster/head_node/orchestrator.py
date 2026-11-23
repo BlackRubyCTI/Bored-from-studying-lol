@@ -70,6 +70,11 @@ VERIFICATION_BUDGET_SECONDS = 25.0
 #: Similarity above which an edge draft is considered "confirmed" by the cluster.
 VERIFICATION_THRESHOLD = 0.55
 
+#: Backends whose output is actual model inference.  Anything else (notably
+#: ``simulator``, and the honest ``unknown``) means the cluster cannot claim
+#: model-grade answers for this milestone's status contract.
+REAL_BACKENDS = frozenset({"llama.cpp", "upstream", "vllm", "transformers"})
+
 
 @dataclass
 class RequestStream:
@@ -1331,6 +1336,13 @@ class Orchestrator:
         totals = self.registry.totals()
         workers = self.registry.snapshot()
         edge_healthy = self.edge.healthy_providers()
+        # Capability truth: answers are "real" only when a healthy source
+        # runs an actual model (llama.cpp / upstream worker, or a healthy
+        # edge API).  Simulator-only clusters must say so, loudly.
+        healthy_backends = sorted({w.backend for w in workers if w.healthy and w.backend})
+        answers_are_real = bool(edge_healthy) or any(
+            backend in REAL_BACKENDS for backend in healthy_backends
+        )
         return ClusterStatus(
             cluster_name=self.settings.cluster_name,
             instance_id=self.settings.instance_id,
@@ -1351,6 +1363,8 @@ class Orchestrator:
             edge_providers=self.edge.provider_names(),
             edge_healthy=edge_healthy,
             workers=workers,
+            answers_are_real=answers_are_real,
+            backends=healthy_backends,
             mode=RequestMode.AUTO,
             autopilot=bool(self.autopilot is not None and self.autopilot.enabled),
             uptime_seconds=round(now_s() - self._started_at, 1),
@@ -1413,4 +1427,4 @@ def _consume_task_result(task: asyncio.Task[Any]) -> None:
         LOGGER.warning("background task failed", extra={"hc_error": str(exc)})
 
 
-__all__ = ["Orchestrator", "RequestStream", "VERIFICATION_THRESHOLD"]
+__all__ = ["Orchestrator", "REAL_BACKENDS", "RequestStream", "VERIFICATION_THRESHOLD"]

@@ -24,9 +24,12 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
-from core.errors import ConfigError
+from core.errors import ConfigError, PublicURLUnsetError
 
 ENV_PREFIX = "HYPER_"
+
+#: Bind addresses that are listening sockets, never routable destinations.
+_WILDCARD_HOSTS = frozenset({"0.0.0.0", "::", "[::]", "*", ""})
 
 #: Root of the project (the directory that contains ``core/``).
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -218,6 +221,12 @@ class Settings:
     max_tool_rounds: int = 4
     sandbox_timeout_seconds: int = 20
     sandbox_memory_limit_mb: int = 512
+    #: "auto" | "container" | "bwrap" | "unshare" | "process".  ``auto`` picks
+    #: the strongest tier the host supports; the tier that actually ran is
+    #: reported in every sandbox result (never assumed).
+    sandbox_isolation: str = "auto"
+    #: Install the seccomp syscall denylist inside the jailed runner.
+    sandbox_seccomp: bool = True
 
     # --- auto-scaler (VRAM-aware model up/down-shift) -----------------------
     autoscaler_enabled: bool = True
@@ -355,6 +364,43 @@ class Settings:
     def logs_path(self) -> Path:
         return Path(self.logs_dir).expanduser()
 
+    # ------------------------------------------------------------------ #
+    @property
+    def public_url_configured(self) -> bool:
+        """True when a routable head-node URL is known (see :meth:`public_head_url`)."""
+        if (self.public_base_url or "").strip():
+            return True
+        return (self.head_host or "").strip() not in _WILDCARD_HOSTS
+
+    def public_head_url(self) -> str:
+        """Return the URL a *remote* worker should call back on.
+
+        Falls back to ``http://{head_host}:{head_port}`` only when the bind host
+        is actually routable.  A wildcard bind address (``0.0.0.0`` / ``::``) is
+        never routable, so handing it to a fresh node provisions a node that
+        silently fails to check in.  We refuse instead, with an actionable error.
+        """
+        base = (self.public_base_url or "").strip()
+        if base:
+            return base.rstrip("/")
+        host = (self.head_host or "").strip()
+        if host in _WILDCARD_HOSTS:
+            raise PublicURLUnsetError(
+                "Cannot hand a head-node URL to a remote worker: "
+                f"HYPER_PUBLIC_BASE_URL is empty and HYPER_HEAD_HOST={host or '(empty)'!r} "
+                "is a bind address, not a routable one. A spawned node would try to "
+                f"check in at http://{host or '0.0.0.0'}:{self.head_port} and never reach us. "
+                "Set HYPER_PUBLIC_BASE_URL to the URL this head node is reachable at from "
+                "other machines — e.g. your Tailscale Funnel/tunnel HTTPS URL such as "
+                "https://my-cluster.tailnet-name.ts.net — then retry.",
+                details={
+                    "env_var": f"{ENV_PREFIX}PUBLIC_BASE_URL",
+                    "head_host": host,
+                    "head_port": self.head_port,
+                },
+            )
+        return f"http://{host}:{self.head_port}"
+
     def ensure_dirs(self) -> None:
         """Create the directories the runtime expects to exist."""
         for directory in (self.data_path, self.state_path, Path(self.logs_dir).expanduser()):
@@ -415,6 +461,8 @@ class Settings:
             max_tool_rounds=_as_int(pick("max_tool_rounds"), defaults.max_tool_rounds),
             sandbox_timeout_seconds=_as_int(pick("sandbox_timeout_seconds"), defaults.sandbox_timeout_seconds),
             sandbox_memory_limit_mb=_as_int(pick("sandbox_memory_limit_mb"), defaults.sandbox_memory_limit_mb),
+            sandbox_isolation=(pick("sandbox_isolation", defaults.sandbox_isolation) or "auto"),
+            sandbox_seccomp=_as_bool(pick("sandbox_seccomp"), defaults.sandbox_seccomp),
             autoscaler_enabled=_as_bool(pick("autoscaler_enabled"), defaults.autoscaler_enabled),
             autoscaler_safety_factor=_as_float(pick("autoscaler_safety_factor"), defaults.autoscaler_safety_factor),
             autoscaler_min_gain=_as_float(pick("autoscaler_min_gain"), defaults.autoscaler_min_gain),

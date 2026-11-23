@@ -193,6 +193,9 @@ async def main() -> int:
         spawner_min_workers=0,
         spawner_tick_seconds=2,
         credential_file="",
+        # M6: provisioning a remote node requires a routable head URL.  Without
+        # this the spawner refuses (correctly) and the hand-over cannot happen.
+        public_base_url="https://head.smoke-m3.example.test",
     )
     registry = WorkerRegistry(
         ttl_seconds=settings.worker_ttl_seconds,

@@ -23,10 +23,8 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import re
 import subprocess
-import sys
 import tempfile
 import time
 from collections import Counter
@@ -36,6 +34,14 @@ from typing import Any
 
 from core.ids import now_s
 from core.logging_setup import get_logger
+from tools.jail import (
+    KERNEL_TIERS,
+    JailConfig,
+    build_jail_command,
+    detect_isolation,
+    jail_script,
+    python_executable,
+)
 
 LOGGER = get_logger("tools.sandbox")
 
@@ -124,6 +130,18 @@ class SandboxResult:
     error: str = ""
     truncated: bool = False
     value: str = ""
+    #: Which isolation tier actually ran: ``container`` / ``bwrap`` /
+    #: ``unshare`` / ``process``.  Reported, never assumed (M6).
+    sandbox_isolation: str = "process"
+    #: True when the child ran against a read-only root filesystem.
+    read_only_root: bool = False
+    #: Human-readable notes about degraded guarantees (empty when full).
+    isolation_notes: list[str] = field(default_factory=list)
+
+    @property
+    def kernel_isolated(self) -> bool:
+        """True when containment came from the kernel, not monkeypatched guards."""
+        return self.sandbox_isolation in KERNEL_TIERS
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -136,6 +154,9 @@ class SandboxResult:
             "error": self.error,
             "truncated": self.truncated,
             "value": self.value,
+            "sandbox_isolation": self.sandbox_isolation,
+            "read_only_root": self.read_only_root,
+            "isolation_notes": list(self.isolation_notes),
         }
 
     def render(self, limit: int = 4000) -> str:
@@ -415,11 +436,72 @@ def _install_path_guard():
     os.path.isdir = guarded_isdir
 
 
+def _install_seccomp_denylist():
+    """Kernel-enforced syscall denylist (M6).
+
+    The outer jail script cannot install this itself: it must still ``execve``
+    the interpreter.  So the filter goes in here, as the very first thing the
+    runner does and before any untrusted code (or any monkeypatched guard) is
+    touched.  Denied syscalls return EPERM instead of killing the process.
+    """
+    import ctypes
+    import ctypes.util
+
+    table = json.loads(os.environ.get("JAIL_ARCH_TABLE", "{}") or "{}")
+    spec = table.get(os.uname().machine)
+    if not spec:
+        return False
+
+    class SockFilter(ctypes.Structure):
+        _fields_ = [("code", ctypes.c_uint16), ("jt", ctypes.c_uint8),
+                    ("jf", ctypes.c_uint8), ("k", ctypes.c_uint32)]
+
+    class SockFprog(ctypes.Structure):
+        _fields_ = [("len", ctypes.c_uint16), ("filter", ctypes.POINTER(SockFilter))]
+
+    deny = ("execve", "execveat", "socket", "mount", "umount2", "pivot_root",
+            "chroot", "ptrace", "process_vm_readv", "process_vm_writev", "bpf",
+            "perf_event_open", "kexec_load", "init_module", "finit_module",
+            "delete_module", "unshare", "setns", "reboot", "swapon", "swapoff",
+            "add_key", "request_key", "keyctl")
+    LD_ABS_W, JEQ_K, RET_K = 0x20, 0x15, 0x06
+    RET_ALLOW, RET_ERRNO, KILL, EPERM = 0x7FFF0000, 0x00050000, 0x80000000, 1
+
+    def ret(k):
+        return SockFilter(RET_K, 0, 0, k)
+
+    prog = [SockFilter(LD_ABS_W, 0, 0, 4)]
+    prog += [SockFilter(JEQ_K, 1, 0, spec["audit"]), ret(KILL)]
+    prog.append(SockFilter(LD_ABS_W, 0, 0, 0))
+    for name in deny:
+        number = spec.get(name)
+        if number is None:
+            continue
+        prog += [SockFilter(JEQ_K, 0, 1, number), ret(RET_ERRNO | EPERM)]
+    prog.append(ret(RET_ALLOW))
+
+    array = (SockFilter * len(prog))(*prog)
+    fprog = SockFprog(len(prog), array)
+    libc = ctypes.CDLL(ctypes.util.find_library("c") or None, use_errno=True)
+    if libc.prctl(38, 1, 0, 0, 0) != 0:  # PR_SET_NO_NEW_PRIVS
+        return False
+    return libc.prctl(22, 2, ctypes.byref(fprog), 0, 0) == 0  # PR_SET_SECCOMP
+
+
 def main():
     _apply_limits()
-    _install_network_guard()
-    _install_process_guard()
-    _install_path_guard()
+    if os.environ.get("JAIL_IN_KERNEL") == "1":
+        try:
+            _install_seccomp_denylist()
+        except Exception:  # noqa: BLE001 - a missing filter must not abort the run
+            pass
+    # ``guards_off`` exists to *test the kernel boundary alone*: when it is set
+    # the monkeypatched guards are skipped, so an escape attempt can only be
+    # stopped by namespaces/seccomp/rlimits.  It is never set in production.
+    if not CONFIG.get("guards_off"):
+        _install_network_guard()
+        _install_process_guard()
+        _install_path_guard()
 
     source = ""
     try:
@@ -483,6 +565,10 @@ class PythonSandbox:
         processes: int = 0,
         allowed_hosts: list[str] | None = None,
         max_output_chars: int = 200_000,
+        isolation: str = "auto",
+        seccomp: bool = True,
+        mask_paths: list[str] | None = None,
+        guards_off: bool = False,
     ) -> None:
         self.workdir = Path(workdir).expanduser() if workdir else Path(tempfile.gettempdir()) / "hypercluster-sandbox"
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -494,10 +580,31 @@ class PythonSandbox:
         self.processes = processes
         self.allowed_hosts = list(allowed_hosts or [])
         self.max_output_chars = max_output_chars
+        #: Test-only: run with the monkeypatched guards disabled so that the
+        #: kernel boundary can be exercised on its own.
+        self.guards_off = bool(guards_off)
+        self.jail = JailConfig(
+            preferred=isolation,
+            seccomp=seccomp,
+            mask_paths=tuple(mask_paths) if mask_paths is not None else JailConfig.mask_paths,
+        )
+
+    # ------------------------------------------------------------------ #
+    @property
+    def isolation(self) -> str:
+        """The tier this sandbox would use right now (probed, not assumed)."""
+        return detect_isolation(self.jail)
 
     # ------------------------------------------------------------------ #
     def run(self, code: str, *, timeout: float | None = None) -> SandboxResult:
-        """Execute ``code`` and return the captured result."""
+        """Execute ``code`` and return the captured result.
+
+        Containment is layered: the kernel jail (namespaces, read-only root,
+        seccomp) is the boundary, and the monkeypatched guards inside the
+        runner remain as defence in depth.  When the kernel refuses every jail
+        tier we still run — and report ``sandbox_isolation: "process"`` so
+        nobody mistakes the guards for a security boundary.
+        """
         limit = timeout if timeout is not None else self.timeout
         started = time.perf_counter()
         with tempfile.TemporaryDirectory(dir=str(self.workdir)) as tmp:
@@ -517,42 +624,81 @@ class PythonSandbox:
                 "allowed_hosts": self.allowed_hosts,
                 "workspace": str(tmp_path),
                 "max_output": self.max_output_chars,
+                "guards_off": bool(self.guards_off),
             }
+            python = python_executable()
             env = {
                 "SANDBOX_CONFIG": json.dumps(config),
-                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "PATH": "/usr/local/bin:/usr/bin:/bin",
                 "HOME": str(tmp_path),
                 "TMPDIR": str(tmp_path),
                 "LANG": "C.UTF-8",
                 "PYTHONHASHSEED": "0",
                 "PYTHONIOENCODING": "utf-8",
             }
+            jail_script_path = tmp_path / "jail.py"
+            limits = {
+                "cpu_seconds": config["cpu_seconds"],
+                "memory_bytes": config["memory_bytes"],
+                "file_size": config["file_size"],
+                "open_files": config["open_files"],
+                "processes": max(1, self.processes or 1),
+            }
+            # A *stable* scratch path is needed because the jail hides /tmp.
+            scratch = tempfile.mkdtemp(prefix="hc-jail-")
             try:
-                completed = subprocess.run(
-                    [sys.executable, "-I", "-B", str(runner_file)],
-                    capture_output=True,
-                    text=True,
-                    timeout=limit,
-                    cwd=str(tmp_path),
-                    env=env,
-                    check=False,
+                jail_script_path.write_text(jail_script(), encoding="utf-8")
+                jail_cmd = build_jail_command(
+                    python=python,
+                    runner_path=str(runner_file),
+                    workspace=str(tmp_path),
+                    jail_script_path=str(jail_script_path),
+                    scratch_dir=scratch,
+                    config=self.jail,
+                    limits=limits,
+                    child_env=env,
                 )
-            except subprocess.TimeoutExpired:
-                return SandboxResult(
-                    ok=False,
-                    timed_out=True,
-                    error=f"execution exceeded the {limit:.0f}s limit",
-                    duration_ms=(time.perf_counter() - started) * 1000.0,
-                )
-            except OSError as exc:
-                return SandboxResult(
-                    ok=False,
-                    error=f"could not start the sandbox process: {exc}",
-                    duration_ms=(time.perf_counter() - started) * 1000.0,
-                )
+                for key, value in jail_cmd.env.items():
+                    env[key] = value
+                if jail_cmd.tier in KERNEL_TIERS and self.jail.seccomp:
+                    env["JAIL_IN_KERNEL"] = "1"
+                try:
+                    completed = subprocess.run(
+                        jail_cmd.argv,
+                        capture_output=True,
+                        text=True,
+                        timeout=limit,
+                        cwd=str(tmp_path),
+                        env=env,
+                        check=False,
+                    )
+                except subprocess.TimeoutExpired:
+                    return SandboxResult(
+                        ok=False,
+                        timed_out=True,
+                        error=f"execution exceeded the {limit:.0f}s limit",
+                        duration_ms=(time.perf_counter() - started) * 1000.0,
+                        sandbox_isolation=jail_cmd.tier,
+                        read_only_root=jail_cmd.read_only_root,
+                        isolation_notes=jail_cmd.notes,
+                    )
+                except OSError as exc:
+                    return SandboxResult(
+                        ok=False,
+                        error=f"could not start the sandbox process: {exc}",
+                        duration_ms=(time.perf_counter() - started) * 1000.0,
+                        sandbox_isolation=jail_cmd.tier,
+                        read_only_root=jail_cmd.read_only_root,
+                        isolation_notes=jail_cmd.notes,
+                    )
+            finally:
+                _rmtree(scratch)
 
         payload = _extract_result(completed.stdout)
         duration = (time.perf_counter() - started) * 1000.0
+        notes = list(jail_cmd.notes)
+        if jail_cmd.tier in KERNEL_TIERS and not jail_cmd.read_only_root:
+            notes.append("root filesystem was not remounted read-only on this host")
         if payload is None:
             return SandboxResult(
                 ok=False,
@@ -561,6 +707,9 @@ class PythonSandbox:
                 returncode=completed.returncode,
                 error="the sandbox process died before reporting a result",
                 duration_ms=duration,
+                sandbox_isolation=jail_cmd.tier,
+                read_only_root=jail_cmd.read_only_root,
+                isolation_notes=notes,
             )
         return SandboxResult(
             ok=bool(payload.get("ok")),
@@ -572,7 +721,18 @@ class PythonSandbox:
             truncated=bool(payload.get("truncated")),
             value=str(payload.get("value") or ""),
             duration_ms=duration,
+            sandbox_isolation=jail_cmd.tier,
+            read_only_root=jail_cmd.read_only_root,
+            isolation_notes=notes,
         )
+
+
+def _rmtree(path: str) -> None:
+    """Best-effort recursive removal (the jail may have tightened modes)."""
+    import shutil
+
+    subprocess.run(["chmod", "-R", "u+rwX", path], capture_output=True, check=False)
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def _extract_result(stdout: str) -> dict[str, Any] | None:

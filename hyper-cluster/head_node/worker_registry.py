@@ -180,6 +180,8 @@ class WorkerRecord:
             healthy=self.healthy,
             compute_tflops=round(self.compute_tflops, 3),
             supported_families=list(self.capabilities.supported_families),
+            backend=(self.capabilities.backend or "unknown").strip() or "unknown",
+            max_concurrency=self.max_concurrency,
         )
 
     def to_dict(self) -> dict[str, Any]:

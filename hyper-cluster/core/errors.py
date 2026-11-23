@@ -41,6 +41,21 @@ class ConfigError(HyperClusterError):
     http_status = 500
 
 
+class PublicURLUnsetError(ConfigError):
+    """Raised when a *remote* node is about to be handed a head-node URL.
+
+    A freshly spawned node cannot reach ``http://0.0.0.0:8080`` — that is the
+    bind address, not a routable address.  Rather than provisioning a node that
+    will silently fail to check in, we refuse and say exactly what to set.
+
+    Deliberately a 4xx (not a 5xx, per law L1): this is an operator
+    precondition, and the message is actionable.
+    """
+
+    code = "public_base_url_unset"
+    http_status = 409
+
+
 class AuthError(HyperClusterError):
     """Raised when a caller presents a missing/incorrect credential."""
 
@@ -136,6 +151,7 @@ class CredentialStoreError(HyperClusterError):
 __all__ = [
     "HyperClusterError",
     "ConfigError",
+    "PublicURLUnsetError",
     "AuthError",
     "ProtocolError",
     "ValidationError",

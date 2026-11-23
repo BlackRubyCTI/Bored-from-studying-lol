@@ -41,7 +41,17 @@ MODEL_DIR="${HYPER_WORKER_MODEL_DIR:-${DATA_DIR}/models}"
 HEAD_URL="${HYPER_WORKER_HEAD_URL:-http://127.0.0.1:8080}"
 MESH_TOKEN="${HYPER_WORKER_MESH_TOKEN:-}"
 MODEL_REPO="${HYPER_WORKER_MODEL_REPO:-Qwen/Qwen2.5-7B-Instruct-GGUF}"
-MODEL_FILE="${HYPER_WORKER_MODEL_FILE:-qwen2.5-7b-instruct-q4_k_m.gguf}"
+# Model selection: one canonical env name, legacy aliases honoured.
+# Canonical: HYPER_WORKER_MODEL_FILENAME (what worker/config.py reads).
+# Aliases:   HYPER_WORKER_MODEL_FILE (pre-M6 spawner/bootstrap name).
+MODEL_FILE="${HYPER_WORKER_MODEL_FILENAME:-${HYPER_WORKER_MODEL_FILE:-}}"
+# Did the operator *explicitly* ask for a specific model? If so we must never
+# silently substitute the default 7B because of an env-name typo.
+MODEL_REQUESTED=0
+if [[ -n "${MODEL_FILE}" ]]; then
+  MODEL_REQUESTED=1
+fi
+DEFAULT_MODEL_FILE="qwen2.5-7b-instruct-q4_k_m.gguf"
 MODEL_SHA256="${HYPER_WORKER_MODEL_SHA256:-}"
 MODEL_FAMILY="${HYPER_WORKER_MODEL_FAMILY:-qwen2}"
 MODEL_PARAMS_B="${HYPER_WORKER_MODEL_PARAMS_B:-7.0}"
@@ -287,7 +297,34 @@ fetch_llama_build() {
   log "llama" "llama.cpp unpacked into ${target_dir}"
 }
 
+select_model() {
+  # Exactly one canonical env name, legacy aliases honoured, no silent default.
+  if [[ "${MODEL_REQUESTED}" == "1" ]]; then
+    if [[ -z "${HYPER_WORKER_MODEL_REPO:-}" ]]; then
+      # A bare filename is only valid for repo "Qwen/...-GGUF" style ids whose
+      # repo we were not told about, so refuse rather than guess a 7B repo.
+      die "model" "HYPER_WORKER_MODEL_FILENAME=${MODEL_FILE} was requested but HYPER_WORKER_MODEL_REPO is empty; set the repo too (e.g. HYPER_WORKER_MODEL_REPO=Qwen/Qwen2.5-3B-Instruct-GGUF)"
+    fi
+    log "model" "operator requested model ${MODEL_REPO}/${MODEL_FILE}"
+    if [[ "${MODEL_PARAMS_B}" == "7.0" ]]; then
+      warn "model" "HYPER_WORKER_MODEL_PARAMS_B is still the 7.0 default; VRAM accounting will be wrong for ${MODEL_FILE} unless the spawner set it"
+    fi
+    return 0
+  fi
+  if [[ "${BACKEND}" == "simulator" ]]; then
+    MODEL_FILE=""
+    log "model" "simulator backend requested; no model weights will be downloaded"
+    return 0
+  fi
+  MODEL_FILE="${DEFAULT_MODEL_FILE}"
+  log "model" "no model requested (HYPER_WORKER_MODEL_FILENAME unset); using the default ${MODEL_REPO}/${MODEL_FILE}"
+}
+
 fetch_model() {
+  if [[ -z "${MODEL_FILE}" ]]; then
+    log "model" "no model file selected; skipping the download"
+    return 0
+  fi
   local target="${MODEL_DIR}/${MODEL_FILE}"
   if [[ -f "${target}" ]]; then
     log "cache" "model already present at ${target}"
@@ -309,7 +346,7 @@ HYPER_WORKER_BIND_HOST=${BIND_HOST}
 HYPER_WORKER_BIND_PORT=${BIND_PORT}
 HYPER_WORKER_PROVIDER=${PROVIDER}
 HYPER_WORKER_REGION=${REGION}
-HYPER_WORKER_MODEL_PATH=${MODEL_DIR}/${MODEL_FILE}
+HYPER_WORKER_MODEL_PATH=${MODEL_FILE:+${MODEL_DIR}/${MODEL_FILE}}
 HYPER_WORKER_MODEL_REPO=${MODEL_REPO}
 HYPER_WORKER_MODEL_FILENAME=${MODEL_FILE}
 HYPER_WORKER_MODEL_FAMILY=${MODEL_FAMILY}
@@ -494,7 +531,7 @@ print_env() {
 HYPER_WORKER_HEAD_URL=${HEAD_URL}
 HYPER_WORKER_BIND_HOST=${BIND_HOST}
 HYPER_WORKER_BIND_PORT=${BIND_PORT}
-HYPER_WORKER_MODEL_PATH=${MODEL_DIR}/${MODEL_FILE}
+HYPER_WORKER_MODEL_PATH=${MODEL_FILE:+${MODEL_DIR}/${MODEL_FILE}}
 HYPER_WORKER_MODEL_REPO=${MODEL_REPO}
 HYPER_WORKER_MODEL_FILENAME=${MODEL_FILE}
 HYPER_WORKER_MODEL_FAMILY=${MODEL_FAMILY}
@@ -532,12 +569,17 @@ uninstall() {
 check_environment() {
   detect_platform
   select_python
+  select_model
   local problems=0
   log "check" "platform=${PLATFORM}/${CPU_ARCH} nvidia=${HAS_NVIDIA} termux=${IS_TERMUX} android=${IS_ANDROID}"
   log "check" "python=${PYTHON_BIN} ($("${PYTHON_BIN}" --version 2>&1))"
   log "check" "head=${HEAD_URL} model=${MODEL_REPO}/${MODEL_FILE}"
   have_cmd curl || { warn "check" "curl is missing"; problems=$((problems+1)); }
-  [[ -d "${MODEL_DIR}/${MODEL_FILE}" ]] || log "check" "the model will be downloaded to ${MODEL_DIR}/${MODEL_FILE}"
+  if [[ -n "${MODEL_FILE}" ]]; then
+    [[ -d "${MODEL_DIR}/${MODEL_FILE}" ]] || log "check" "the model will be downloaded to ${MODEL_DIR}/${MODEL_FILE}"
+  else
+    log "check" "no model file selected (simulator backend)"
+  fi
   [[ -x "${VENV_DIR}/bin/python" ]] || log "check" "the virtualenv will be created at ${VENV_DIR}"
   if [[ "${problems}" -gt 0 ]]; then
     die "check" "${problems} problem(s) found"
@@ -564,6 +606,7 @@ main() {
     install)
       install_system_deps
       select_python
+      select_model
       setup_venv
       fetch_llama_build
       fetch_model
