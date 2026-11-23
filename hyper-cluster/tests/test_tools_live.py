@@ -111,6 +111,35 @@ def test_sandbox_writes_only_inside_its_workspace(sandbox: PythonSandbox) -> Non
     assert result.ok is False
 
 
+def test_sandbox_cannot_read_host_secrets(sandbox: PythonSandbox, tmp_path: Path) -> None:
+    """Regression: the sandbox must not be able to read the head node's .env."""
+    secret = tmp_path / "credentials.env"
+    secret.write_text("HYPER_API_KEY=super-secret\n", encoding="utf-8")
+    result = sandbox.run(f"print(open({str(secret)!r}).read())")
+    assert result.ok is False
+    assert "permission" in (result.stderr + result.error).lower()
+    assert "super-secret" not in result.stdout
+
+
+def test_sandbox_cannot_write_outside_its_workspace(sandbox: PythonSandbox, tmp_path: Path) -> None:
+    target = tmp_path / "sandbox-escape.txt"
+    result = sandbox.run(f"open({str(target)!r}, 'w').write('x')")
+    assert result.ok is False
+    assert not target.exists()
+
+
+def test_sandbox_can_write_inside_its_workspace(sandbox: PythonSandbox) -> None:
+    result = sandbox.run("open('notes.txt','w').write('hello'); print(open('notes.txt').read())")
+    assert result.ok is True
+    assert "hello" in result.stdout
+
+
+def test_sandbox_can_still_import_the_standard_library(sandbox: PythonSandbox) -> None:
+    result = sandbox.run("import json, os, re, collections; print(sorted(json.loads('{\"b\":1}')))")
+    assert result.ok is True
+    assert "b" in result.stdout
+
+
 def test_sandbox_captures_the_last_expression(sandbox: PythonSandbox) -> None:
     result = sandbox.run("2 ** 10")
     assert result.ok is True

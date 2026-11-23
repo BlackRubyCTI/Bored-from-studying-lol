@@ -252,6 +252,9 @@ class Settings:
     evolution_enabled: bool = False
     #: How long the cluster must be quiet before it starts training.
     evolution_idle_seconds: int = 300
+    #: How long it stays quiet after a cycle before it may learn again
+    #: (0 = the engine may start the next cycle as soon as one finished).
+    evolution_cooldown_seconds: int = 300
     #: The budget a user request has to preempt the training.
     evolution_preempt_budget_seconds: float = 2.0
     #: How many synthetic examples one cycle trains on.
@@ -443,6 +446,9 @@ class Settings:
             memory_context_top_k=_as_int(pick("memory_context_top_k"), defaults.memory_context_top_k),
             evolution_enabled=_as_bool(pick("evolution_enabled"), defaults.evolution_enabled),
             evolution_idle_seconds=_as_int(pick("evolution_idle_seconds"), defaults.evolution_idle_seconds),
+            evolution_cooldown_seconds=_as_int(
+                pick("evolution_cooldown_seconds"), defaults.evolution_cooldown_seconds
+            ),
             evolution_preempt_budget_seconds=_as_float(
                 pick("evolution_preempt_budget_seconds"), defaults.evolution_preempt_budget_seconds
             ),

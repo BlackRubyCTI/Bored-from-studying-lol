@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pytest
 
+from core.ids import now_s
 from core.protocol import ChatCompletion, ChatRequest
 from head_node.worker_registry import WorkerRecord, WorkerRegistry
 from memory.vector_memory import VectorMemory
@@ -244,8 +246,10 @@ async def test_the_checkpoint_is_written_and_resumed(tmp_path: Path) -> None:
 
     resumed = DistributedTrainer(checkpoint_dir=tmp_path / "ckpt", steps=8, dim=32, rank=4)
     report = await resumed.train(_traces(), shards=1)
-    assert report.steps == 8
-    assert Checkpoint.latest(resumed.checkpoint_dir).step == 8
+    # every run does its own ``steps`` worth of work on top of the checkpoint
+    assert report.steps == 8 + 4
+    assert Checkpoint.latest(resumed.checkpoint_dir).step == 12
+    assert Checkpoint.latest(resumed.checkpoint_dir).step == report.steps
 
 
 async def test_a_preemption_stops_the_training(tmp_path: Path) -> None:
@@ -469,3 +473,49 @@ async def test_a_user_request_preempts_the_cycle_in_under_two_seconds(tmp_path: 
     assert autopilot.preempt_latency_ms < 2000.0
     # the whole cycle must have stopped well before the budget
     assert elapsed < 2000.0
+
+
+async def test_the_engine_does_not_loop_back_to_back(tmp_path: Path) -> None:
+    """Regression: a finished cycle must restart the idle countdown.
+
+    Without this the sleep-time engine ran a full train/hot-reload cycle every
+    couple of seconds on an idle cluster instead of waiting for the window.
+    """
+    autopilot, memory, _ = _autopilot(tmp_path)
+    memory.record_exchange("how do I deploy the cluster", "kubectl apply the helm chart")
+    settings = _Settings()
+    settings.evolution_idle_seconds = 30
+    settings.evolution_cooldown_seconds = 30
+    autopilot.settings = settings
+    autopilot.last_activity = now_s() - 3600.0
+
+    autopilot.start()
+    try:
+        deadline = time.time() + 30.0
+        while time.time() < deadline and not autopilot.reports:
+            await asyncio.sleep(0.1)
+        assert autopilot.reports, "the engine never ran its first cycle"
+        await asyncio.sleep(3.0)
+        assert len(autopilot.reports) == 1, "the engine started a second cycle immediately"
+        assert now_s() - autopilot.last_activity < 10.0
+    finally:
+        await autopilot.aclose()
+
+
+async def test_every_cycle_keeps_learning(tmp_path: Path) -> None:
+    """Regression: a resumed cycle must still do a full run of training.
+
+    With an absolute step target the second cycle found the checkpoint at
+    ``steps`` and trained zero steps, re-merging identical weights: the
+    artifact hash never changed again after the first cycle.
+    """
+    autopilot, memory, _ = _autopilot(tmp_path)
+    memory.record_exchange("how do I deploy the cluster", "deploy the cluster with kubectl apply the helm chart")
+
+    first = await autopilot.run_cycle()
+    second = await autopilot.run_cycle()
+    assert first.error == "" and second.error == ""
+    assert first.training.steps == autopilot.trainer.steps
+    assert second.training.steps == 2 * autopilot.trainer.steps  # resumed, still 4 more steps
+    assert second.training.loss_end > 0.0
+    assert second.artifact_sha256  # a fresh, non-empty brain
