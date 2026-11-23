@@ -77,6 +77,8 @@
 | **3 — Headless API compute spawner & VRAM auto-scaler** | `head_node/{auto_spawner.py,model_selector.py}` | ✅ **complete** |
 | **4 — Infinite memory & sleep-time self-evolution** | `memory/{vector_memory,sync}.py`, `training/{autopilot_evolver,self_play,synthetic_data,prompt_evolver,distributed_trainer,checkpoint_streamer,qlora}.py`, `worker/brain.py` | ✅ **complete** |
 | **5 — Mobile PWA mission control, phone alerts, one-command installer** | `mobile/{dashboard.py,cli.py,notifier.py,qr.py}`, `mobile/static/*`, `memory/pdf.py`, `install_all.sh` | ✅ **complete** |
+| **6 — Truth, hygiene and a real jail** | `tools/jail.py`, `tools/sandbox.py`, `core/{config,errors,protocol}.py`, `worker/bootstrap.sh`, `worker/config.py`, `head_node/{auto_spawner,worker_registry,orchestrator,app}.py` | ✅ **complete** |
+| **7 — Real learning (QLoRA) + a measured eval delta** | `training/{torch_qlora,evaluate}.py`, `training/{autopilot_evolver,checkpoint_streamer,distributed_trainer}.py`, `head_node/orchestrator.py`, `core/config.py` | ✅ **complete** |
 
 ---
 
@@ -603,6 +605,117 @@ It is idempotent: a second run only refreshes what is missing.
 
 ---
 
+## 6b. Milestone 6 — truth, hygiene and a real jail (implemented)
+
+M6 is a *correctness* milestone: it removes four ways the system could lie to its
+operator, and replaces one pretend boundary with a real one.
+
+### 6b.1 One canonical model name
+
+Before M6, `auto_spawner._worker_bootstrap` exported
+`HYPER_WORKER_MODEL_FILENAME` while `worker/bootstrap.sh` read only
+`HYPER_WORKER_MODEL_FILE`.  A spawned node therefore fell through to the
+hard-coded default and silently downloaded a **7B** model whatever the planner
+asked for.
+
+```
+spawner  →  HYPER_WORKER_MODEL_FILENAME=llama-3.2-3b-...gguf     (M6: + _FILE, + _REPO, + _PARAMS_B)
+bootstrap→  MODEL_FILE="${HYPER_WORKER_MODEL_FILENAME:-${HYPER_WORKER_MODEL_FILE:-}}"
+config   →  model_filename = first non-empty of (MODEL_FILENAME, MODEL_FILE)
+```
+
+`select_model()` now has three explicit outcomes instead of one silent fallback:
+
+| Situation | Behaviour |
+|---|---|
+| a model **and** a repo are set | load exactly that model |
+| a model is set but no repo | **refuse to start** (`die`) — never substitute |
+| `HYPER_WORKER_BACKEND=simulator` | download **no** weights at all |
+| nothing set at all | use the default 7B **and log it loudly** |
+
+### 6b.2 A routable head URL, or no provisioning
+
+`Settings.public_head_url()` is the single source of truth for the URL a remote
+node must call back on.  `0.0.0.0`, `::`, `*` and the empty string are **bind**
+addresses, never destinations: they now raise `PublicURLUnsetError`
+(HTTP 409 — an operator precondition, so it never becomes a user-visible 5xx).
+
+Refusal happens in three places, all before a provider is called:
+
+* `AutoSpawner._head_url_or_error()` → used by TTL rotation and scale-out
+  (`tick` refuses the whole round and records one `ok=False` action);
+* `AutoSpawner._provision_replacement()` → returns a `SpawnResult` with
+  `meta.error_code = "public_base_url_unset"`;
+* `POST /v1/spawner/provision` → raises HTTP 409 with the same actionable body.
+
+The one deliberate exception is the worker-registration **ack**: a worker that is
+already talking to us must never fail registration over a cosmetic field, so that
+field falls back to a clearly-labelled placeholder and logs a warning.
+
+### 6b.3 Capability truth
+
+The protocol gained two honest fields:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `WorkerSnapshot.backend` | `str = "unknown"` | what the worker *reports* it runs; never guessed |
+| `WorkerSnapshot.max_concurrency` | `int = 1` | advertised concurrency slots (the basis of "virtual cores") |
+| `ClusterStatus.answers_are_real` | `bool = False` | true only with a healthy `llama.cpp`/`upstream`/`vllm` worker or a healthy edge provider |
+| `ClusterStatus.backends` | `list[str]` | the distinct backends currently serving |
+
+`/v1/status` additionally carries a `capability` block (`label`, `detail`,
+`simulator_only`) which is what the PWA badge binds to.  The default value of
+`answers_are_real` is `False`, so a code path that forgets to decide fails
+**honest**, not optimistic.
+
+`GET /v1/capacity/plan` reports:
+
+* `virtual_vram_gb` — summed from measured worker VRAM;
+* `virtual_cores.concurrent_slots` — summed advertised `max_concurrency` of
+  healthy, non-draining workers (with the method stated);
+* `measured_tokens_per_sec` — the registry's measured aggregate;
+* `claim` — **only** populated when `answers_are_real` *and* aggregate tok/s > 0
+  *and* a model is active; otherwise `null`, with `why_no_claim` explaining what
+  is missing.
+
+### 6b.4 The jail
+
+`tools/jail.py` provides a tiered, probed isolation layer:
+
+```
+container (nsjail)  →  bwrap  →  unshare  →  process
+```
+
+Tiers are *probed*, not assumed (`unshare -Urmpfn --kill-child true`), and the
+tier that actually ran is reported as `sandbox_isolation` on every
+`SandboxResult`, alongside `read_only_root` and `isolation_notes`.
+
+The `unshare` tier mounts:
+
+1. a tmpfs at `/tmp`, into which the untrusted workspace is bind-mounted at
+   `/tmp/.hc-work` **before** the parent is hidden;
+2. size-1M mode-000 tmpfs masks over `/home`, `/root`, `/var/tmp`, `/dev/shm`,
+   `/mnt`, `/media`, `/srv`;
+3. a locked `remount,ro,bind /` read-only root where the kernel permits it;
+4. a fresh `/proc` with only the jail's own PID visible.
+
+Then the **runner** installs a seccomp BPF denylist as its first action, before
+any untrusted code and before the monkeypatched guards:
+
+```
+execve, execveat, socket, mount, umount2, pivot_root, chroot, ptrace,
+process_vm_readv, process_vm_writev, bpf, perf_event_open, kexec_load,
+init_module, finit_module, delete_module, unshare, setns, reboot,
+swapon, swapoff, add_key, request_key, keyctl        → EPERM
+```
+
+The filter is installed by the runner rather than the jail script because the
+jail script must still `execve` the interpreter itself.  The monkeypatched path
+guards remain as defence in depth, and `guards_off=True` exists so the test
+suite can prove the **kernel** boundary alone.
+
+---
+
 ## 7. Repository layout
 
 ```
@@ -616,7 +729,8 @@ hyper-cluster/
 │   ├── mesh.py              Tailscale automation
 │   ├── brain.py             the hot-reloadable LoRA brain
 │   └── bootstrap.sh         zero-touch provisioning
-├── tools/                   tool-use sandbox (M2 ✅)
+├── tools/                   tool-use sandbox (M2 ✅, M6 ✅)
+│   ├── jail.py              tiered kernel isolation: namespaces, seccomp, RO root
 │   └── sandbox.py           python isolation, web, files, tool protocol
 ├── memory/                  vector memory   (M4 ✅, M5 ✅)
 │   ├── vector_memory.py     store, hybrid retrieval, facts, snapshots
@@ -626,9 +740,11 @@ hyper-cluster/
 │   ├── autopilot_evolver.py the idle watchdog + the preemption contract
 │   ├── synthetic_data.py    mining + deterministic mutations
 │   ├── self_play.py         fan-out drafting + critic scoring
-│   ├── distributed_trainer.py federated, checkpointed, preemptible
-│   ├── qlora.py             the maths (ridge, int8, SVD, merge)
-│   ├── checkpoint_streamer.py push/pull the training state
+│   ├── distributed_trainer.py federated, checkpointed, preemptible (numpy fallback)
+│   ├── torch_qlora.py       REAL QLoRA: adapters, capability probing, install (M7 ✅)
+│   ├── evaluate.py          held-out, prompt-grouped eval + delta (M7 ✅)
+│   ├── qlora.py             the maths (ridge, int8, SVD, merge) + the wire format
+│   ├── checkpoint_streamer.py push/pull the training state (matrices and adapters)
 │   └── prompt_evolver.py    mutate, benchmark, promote
 ├── mobile/                  the mission control  (M5 ✅)
 │   ├── dashboard.py         the PWA + the API proxy
@@ -636,10 +752,91 @@ hyper-cluster/
 │   ├── cli.py               the Termux command line (hc)
 │   ├── qr.py                the dependency-free QR encoder
 │   └── static/              the shell (HTML, CSS, JS, manifest, service worker, icon)
-├── tests/                   live test-suite (331 tests, real HTTP + SSE)
-├── scripts/                 smoke harnesses (M1 + M2 + M3 + M4 + M5)
+├── tests/                   live test-suite (414 tests, real HTTP + SSE)
+├── scripts/                 smoke harnesses (M1..M7)
 ├── install_all.sh           the one-command installer (M5 ✅)
 ├── .env.example             configuration template
 ├── ARCHITECTURE.md          this document
 └── pyproject.toml
 ```
+
+---
+
+## 9. Milestone 7 — real learning (implemented)
+
+### 9.1 The problem with M4's trainer
+
+`distributed_trainer.py` trains a **ridge regression** over token co-occurrence.
+It is deterministic, shardable, resumable and preemptible, and it produces a merged
+matrix the workers can use as a hint. It is also **not** a language-model
+fine-tune, and the honest thing to do with that gap was to close it rather than
+rename it.
+
+M7 adds a real trainer and keeps the ridge one as the fallback. Selection is by
+**capability probe**, not by a config flag alone:
+
+```
+AutoTrainer(preferred="auto")
+   ├── torch_available()      torch + transformers + peft all import?
+   ├── cuda_available()       torch.cuda.is_available()?
+   ├── quantized_available()  bitsandbytes importable AND CUDA present?
+   └── resolve_base_model()   local path → hf-cache → offline-selftest
+        ↓
+   backend = "torch" | "math"   ← reported, with a reason, on every run
+```
+
+Probing is deliberately defensive: a *broken* install (half-installed torch, an
+ABI mismatch, a driver that raises on import, an unreadable model cache) is
+reported as "not available" so the node degrades to the math trainer instead of
+taking the control plane down at startup.
+
+### 9.2 What a torch run actually does
+
+1. **Resolve a base model.** A local directory wins; otherwise an
+   already-cached HF model is used *only* with `local_files_only=True`; otherwise
+   the 115k-parameter self-test model is built from a config. The chosen source is
+   recorded in `report.base_model_source` and named in the report's notes.
+2. **Wrap it in LoRA.** `LoraConfig(r=8, lora_alpha=16, target_modules=("q_proj",
+   "v_proj"))` — on the tiny model this is 4,096 trainable parameters of 118,xxx
+   (3.4 %).
+3. **Train on answer tokens.** Prompt tokens are masked to `-100`, so the loss
+   measures the answer, not the question.
+4. **Evaluate a held-out split before and after.** The split is grouped by
+   prompt (a prompt's variants never straddle the boundary) and is deterministic
+   via a sha256 seed.
+5. **Save a real adapter** — `adapter_model.safetensors`, `adapter_config.json`
+   and `hyper_metrics.json` — and record a sha256 of what was written.
+6. **Bridge it to the mesh.** `adapter_to_brain_artifact()` produces the
+   `BrainArtifact` the workers already hot-reload, carrying the adapter as a
+   compressed base64 payload with `metadata["format"] = "peft-adapter"`.
+   `install_adapter()` reconstitutes a servable `PeftModelForCausalLM`.
+7. **Pack and stream it.** `AdapterArtifact.pack()` emits one `.tar.gz` that the
+   existing checkpoint streamer uploads, and `list_remote()` sees it.
+
+### 9.3 Preemption is unchanged
+
+The contract from M4 is a hard budget: a chat must interrupt training inside two
+seconds. The torch trainer checks the same `PreemptionToken` between steps and
+honours `step_delay`, and a preempted run **still saves its adapter** rather than
+discarding the work. Measured here: **205 ms**.
+
+### 9.4 Honesty encoded as assertions
+
+The tests do not merely *print* the caveats, they assert them:
+
+* if the offline self-test model ran, the report must contain the note that says
+  so (`test_the_report_labels_the_offline_self_test_model`);
+* the precision actually used must be recorded
+  (`test_precision_is_recorded_not_assumed`);
+* a failed model load must set `report.error` and leave `merged=False` rather
+  than reporting a successful empty run
+  (`test_a_missing_model_is_an_error_not_a_fake_success`);
+* a scorer that cannot produce a likelihood must not look perfect
+  (`test_evaluate_does_not_invent_a_loss_when_no_likelihood_exists`).
+
+### 9.5 What is *not* verified on this host
+
+`huggingface.co` is unreachable from the sandbox, so no pretrained weights were
+downloaded; and there is no CUDA device, so the 4-bit NF4 path imports but cannot
+be exercised. Both facts are reported by the code itself (`base_model_source =
+"offline-selftest"`, `precision = "fp32"`) and restated in `REVIEW.md`.

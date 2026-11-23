@@ -7,7 +7,8 @@ A headless GPU compute pool, a sub-second inference path, and a phone-first miss
 > **M1** — control plane & resilient orchestrator · **M2** — self-benchmarking worker, mesh & tool sandbox ·
 > **M3** — headless compute spawner, VRAM auto-scaler & speculative pairing ·
 > **M4** — infinite memory & sleep-time self-evolution ·
-> **M5** — the mobile mission control (PWA, phone alerts, Termux CLI, one-command installer).
+> **M5** — the mobile mission control (PWA, phone alerts, Termux CLI, one-command installer) ·
+> **M6** — truth, hygiene and a real jail (no silent model, no fake head URL, capability truth, kernel isolation).
 
 ---
 
@@ -94,6 +95,70 @@ A headless GPU compute pool, a sub-second inference path, and a phone-first miss
 | A dependency-free **QR encoder** (the phone scans the dashboard address) | `mobile/qr.py` |
 | The **one-command installer**: `.env` wizard, Drive + Hub wiring, systemd/Termux autostart, QR code | `install_all.sh` |
 | 331 tests, including a **live** dashboard, a real PDF upload and the preemption race | `tests/` |
+
+### Milestone 6 — truth, hygiene and a real jail
+
+Four lies are gone. Each one was a real defect found by running the system, and each
+fix is covered by a test that fails on the pre-M6 code.
+
+| Capability | Where |
+|---|---|
+| **One canonical model env name.** The spawner exported `HYPER_WORKER_MODEL_FILENAME` while `bootstrap.sh` read `HYPER_WORKER_MODEL_FILE`, so every spawned node silently downloaded the default 7B. The canonical name is now read first, the legacy alias still works, and the generated bootstrap exports **both**. | `worker/bootstrap.sh`, `worker/config.py`, `head_node/auto_spawner.py` |
+| **No silent substitution.** A requested model with no repo is a hard error; a simulator node downloads no weights; the 7B default is logged, never assumed. | `worker/bootstrap.sh` (`select_model`) |
+| **No fake head URL.** With `HYPER_PUBLIC_BASE_URL` empty the spawner refuses to provision and returns a 4xx that names the variable and the reason — instead of handing a remote node `http://0.0.0.0:8080` and burning quota on a node that never checks in. | `core/config.py` (`public_head_url`), `core/errors.py` (`PublicURLUnsetError`), `head_node/auto_spawner.py`, `head_node/app.py` |
+| **Capability truth on the wire.** `/v1/status` reports each worker's real `backend` plus top-level `answers_are_real`, `backends` and a `capability` block spelling out that simulator answers are **not model output**. | `core/protocol.py`, `head_node/worker_registry.py`, `head_node/orchestrator.py`, `head_node/app.py` |
+| **`/v1/capacity/plan`** — reports mechanical capacity (VRAM pool, virtual cores from advertised `max_concurrency`) and attaches a model-grade claim **only** when a real backend is measured serving. Otherwise `claim: null` plus a `why_no_claim` explaining exactly what is missing. | `head_node/app.py` |
+| **PWA capability badge** — "simulator — not model output" or "live model", driven by `/v1/status`, visible on the phone. | `mobile/static/index.html`, `mobile/static/app.js`, `mobile/static/styles.css` |
+| **A real jail.** User + mount + PID + network namespaces, a fresh `/proc`, masked homes, a read-only root, and a seccomp syscall denylist installed inside the runner. Tiers are probed (`nsjail` → `bwrap` → `unshare` → `process`); the tier that actually ran is reported as `sandbox_isolation` on every result. | `tools/jail.py`, `tools/sandbox.py` |
+| **Escape tests that prove the kernel holds** with the monkeypatched guards **disabled**: `ctypes` `socket(2)`/`execve(2)`, `importlib` reload of `os`, `/proc`, symlinks, read-only root, host homes. | `tests/test_m6_truth_and_jail.py` |
+
+Honest limits, measured on this host: `nsjail` and `bwrap` are not installed here, so
+the tier exercised is `unshare`. The read-only root remount is **not** available under
+Docker's default seccomp profile; when the kernel refuses, the result says so in
+`isolation_notes` rather than pretending. See `REVIEW.md` for the measurements.
+
+### Milestone 7 — real learning (QLoRA), and no lying about it
+
+Through M6 the "self-evolution" trainer was an honest but tiny thing: a numpy
+ridge regression over token co-occurrence. It learned something, it merged into a
+shippable brain, and it preempted instantly — but it was **not** a language-model
+fine-tune, and calling it one would have been the biggest lie in the repo.
+
+M7 replaces it with **real QLoRA**: LoRA adapters trained with `torch` /
+`transformers` / `peft`, saved as a loadable adapter, measured against a held-out
+split, and hot-reloaded into the serving path. The numpy trainer is **not
+deleted** — it is the capability-detected fallback, and it still runs on a box
+with no torch at all.
+
+| Capability | Where |
+|---|---|
+| **A real fine-tune.** `TorchQLoRATrainer` loads a base model under `peft.LoraConfig` (r=8, α=16 on `q_proj`/`v_proj`), trains on conversation traces with the loss taken on **answer tokens only**, and writes a genuine `adapter_model.safetensors` + `adapter_config.json`. | `training/torch_qlora.py` |
+| **Measured, not asserted.** Every run evaluates a **held-out, prompt-grouped** split before and after, and stores `loss_delta` / `exact_match_delta` / `token_f1_delta` **next to the adapter** in `hyper_metrics.json`. A run that did not improve says so. | `training/evaluate.py` |
+| **Backend chosen by capability.** `AutoTrainer` probes for torch/transformers/peft, CUDA and bitsandbytes, prefers QLoRA when it is really available, and falls back to numpy otherwise. Every report carries `backend`, `model`, `precision` and `base_model_source`. | `training/torch_qlora.py`, `head_node/orchestrator.py` |
+| **The adapter reaches the workers.** The saved adapter is bridged into the existing `BrainArtifact` wire format and accepted by `worker/brain.py::Brain.load` — the same hot-reload path the mesh already used — and `install_adapter()` reconstitutes a servable PEFT model. | `training/torch_qlora.py` (`adapter_to_brain_artifact`, `install_adapter`), `training/autopilot_evolver.py` |
+| **It still preempts instantly.** A chat interrupting a QLoRA run stopped the trainer in **205 ms** (measured; the budget is 2 s), and a preempted run still saves what it learned. | `tests/test_m7_qlora.py`, `scripts/smoke_m7.py` |
+| **The model travels to the cloud.** The adapter directory is packed into one `.tar.gz` and streamed by the existing checkpoint streamer; the cloud listing sees adapter archives, not just `.npz` matrices. | `training/checkpoint_streamer.py` (`push_bytes`), `training/autopilot_evolver.py` |
+
+Honest limits, measured on this host:
+
+* **The base model is a 115k-parameter self-test model.** `huggingface.co` is not
+  reachable from this sandbox, so no pretrained weights could be downloaded. Every
+  report for that model carries the note *"base model is the offline self-test
+  model (115k params): this proves the QLoRA path runs, not that a production
+  model was improved"*. Point `HYPER_EVOLUTION_BASE_MODEL` at a cached model to
+  train something real; the label follows the model.
+* **4-bit is not exercised here.** `bitsandbytes` imports, but there is no CUDA
+  device, so `quantized_available()` is `False` and the reported precision is
+  `fp32`. The 4-bit code path exists and is selected automatically on a GPU; it is
+  **unverified on this machine**, and `REVIEW.md` says so.
+* **The delta is small and the metrics are honest about their scale.** On the tiny
+  model, held-out loss moved `5.4765 → 4.7572` (Δ +0.7193) in the smoke run;
+  exact-match and token-F1 stayed at `0.0` because a 115k model cannot reproduce
+  free text. The trainer reports exactly that rather than hiding it behind the
+  loss number.
+* **`torch` is still optional.** It lives in the `[training]` extra and no
+  mandatory dependency was added; `make test` is green with and without it
+  (414 passed with torch; 402 passed, 13 skipped without).
 
 ---
 
@@ -262,14 +327,18 @@ between accounts automatically.
 ## Verification
 
 ```bash
-make test        # 331 tests: live HTTP/SSE servers, failover, sandbox, mesh, bootstrap, auto-scaler, memory, self-evolution, mobile
+make test        # 414 tests: live HTTP/SSE servers, failover, sandbox, mesh, bootstrap, auto-scaler, memory, self-evolution, mobile, M6 truth + jail, M7 QLoRA + eval
 make lint        # ruff over core/head_node/worker/tools/memory/training/mobile/tests/scripts
 make smoke       # Milestone 1 smoke test (23 checks)
 make smoke-m2    # Milestone 2 smoke test (31 checks)
 make smoke-m3    # Milestone 3 smoke test (27 checks: hot-swap, scaling, zero-downtime hand-over)
 make smoke-m4    # Milestone 4 smoke test (40 checks: memory, cloud sync, self-evolution, instant preemption)
 make smoke-m5    # Milestone 5 smoke test (39 checks: the PWA, the proxy, the PDF, the alerts, the QR)
+make smoke-m6    # Milestone 6 smoke test (62 checks: model hygiene, head URL, capability truth, the jail)
+make smoke-m7    # Milestone 7 smoke test (38 checks: real QLoRA, eval delta, adapter reload, preemption)
 ```
+
+The full sweep is `23 + 31 + 27 + 40 + 39 + 62 + 38 = 260` checks, all green.
 
 ---
 
@@ -280,5 +349,7 @@ make smoke-m5    # Milestone 5 smoke test (39 checks: the PWA, the proxy, the PD
 3. ✅ **Headless API compute spawner & VRAM auto-scaler**
 4. ✅ **Infinite memory & sleep-time self-evolution**
 5. ✅ **Mobile PWA mission control, phone alerts & one-command installer**
+6. ✅ **Truth, hygiene and a real jail** — capability truth, a refusing spawner, kernel-enforced isolation
+7. ✅ **Real learning** — QLoRA fine-tuning, a held-out eval delta, and an honest fallback
 
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full blueprint.

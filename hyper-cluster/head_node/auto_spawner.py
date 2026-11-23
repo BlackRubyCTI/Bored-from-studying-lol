@@ -64,6 +64,7 @@ from core.credentials import (
     CredentialVault,
     get_vault,
 )
+from core.errors import PublicURLUnsetError
 from core.ids import now_s
 from core.logging_setup import get_logger
 from core.providers import get_provider
@@ -236,6 +237,38 @@ class ComputeProvisioner(ABC):
         """Destroy the compute; ``True`` when the provider confirmed it."""
 
     # ------------------------------------------------------------------ #
+    def _model_exports(self, request: SpawnRequest) -> list[str]:
+        """``export`` lines that pin the model a spawned node must load (M6).
+
+        Before M6 this exported only ``HYPER_WORKER_MODEL_FILENAME`` while
+        ``worker/bootstrap.sh`` read only ``HYPER_WORKER_MODEL_FILE``, so every
+        spawned node silently downloaded the default 7B.  We now emit the
+        canonical name **and** the legacy alias, and we omit a variable rather
+        than exporting an empty value that would clobber a sane default.
+        """
+        model = (request.model or "").strip()
+        if not model:
+            # No model requested: say so explicitly instead of letting the node
+            # guess.  ``simulator`` is the honest backend in that case.
+            return [
+                "export HYPER_WORKER_MODEL_FILENAME=",
+                "export HYPER_WORKER_MODEL_FILE=",
+            ]
+        exports = [
+            f"export HYPER_WORKER_MODEL_FILENAME={shlex.quote(model)}",
+            f"export HYPER_WORKER_MODEL_FILE={shlex.quote(model)}",
+        ]
+        repo = (request.labels.get("model_repo") or "").strip()
+        if repo:
+            exports.append(f"export HYPER_WORKER_MODEL_REPO={shlex.quote(repo)}")
+        if request.params_b:
+            exports.append(
+                f"export HYPER_WORKER_MODEL_PARAMS_B={shlex.quote(f'{request.params_b:g}')}"
+            )
+        if request.family:
+            exports.append(f"export HYPER_WORKER_MODEL_FAMILY={shlex.quote(request.family)}")
+        return exports
+
     def _worker_bootstrap(self, request: SpawnRequest) -> str:
         """The script the provisioned node runs to join the cluster."""
         model = request.model or ""
@@ -251,8 +284,7 @@ class ComputeProvisioner(ABC):
                 f"export HYPER_WORKER_MESH_TOKEN={shlex.quote(request.mesh_token)}",
                 f"export HYPER_WORKER_PROVIDER={shlex.quote(request.provider)}",
                 f"export HYPER_WORKER_REGION={shlex.quote(request.region)}",
-                f"export HYPER_WORKER_MODEL_FILENAME={shlex.quote(model)}",
-                f"export HYPER_WORKER_MODEL_FAMILY={shlex.quote(request.family or '')}",
+                *self._model_exports(request),
                 f"export HYPER_WORKER_TTL_SECONDS={shlex.quote(str(int(request.ttl_seconds)))}",
                 f"export HYPER_WORKER_BACKEND={shlex.quote(backend)}",
                 "if [ ! -f ./worker/bootstrap.sh ]; then",
@@ -1040,7 +1072,31 @@ class AutoSpawner:
         out.sort(key=lambda r: r.registered_at, reverse=True)
         return out
 
+    def _head_url(self) -> str:
+        """The routable URL a remote worker must call back on (M6).
+
+        Refuses loudly instead of handing out ``http://0.0.0.0:8080``, which
+        produces a node that provisions "successfully" and never checks in.
+        """
+        return self.settings.public_head_url()
+
+    def _head_url_or_error(self) -> tuple[str, str]:
+        """Return ``(url, error)``; ``error`` is '' when the URL is usable."""
+        try:
+            return self._head_url(), ""
+        except PublicURLUnsetError as exc:
+            return "", f"{exc.message} [{exc.code}]"
+
     async def _provision_replacement(self, old: WorkerRecord) -> SpawnResult:
+        head_url, head_error = self._head_url_or_error()
+        if head_error:
+            return SpawnResult(
+                ok=False,
+                provider=old.provider,
+                instance_id="",
+                error=head_error,
+                meta={"error_code": PublicURLUnsetError.code},
+            )
         request = SpawnRequest(
             provider=old.provider,
             region=old.region,
@@ -1051,7 +1107,7 @@ class AutoSpawner:
             ttl_seconds=self.settings.spawner_default_ttl_seconds,
             labels={"replaces": old.worker_id, "origin": "ttl-rotator"},
             replaces=old.worker_id,
-            head_url=self.settings.public_base_url or f"http://{self.settings.head_host}:{self.settings.head_port}",
+            head_url=head_url,
             mesh_token=self.settings.mesh_token,
         )
         return await self.provision(request)
@@ -1162,6 +1218,23 @@ class AutoSpawner:
             if not providers:
                 providers = [p for p in self.provisioners if p != "edge_api"]
             index = 0
+            head_url, head_error = self._head_url_or_error()
+            if head_error:
+                # Refuse the whole scale-out round: provisioning nodes that
+                # cannot phone home is worse than staying small.
+                LOGGER.warning(
+                    "scale-out refused: no routable head URL",
+                    extra={"hc_error": head_error[:200]},
+                )
+                actions.append(
+                    RotatorAction(
+                        kind="scale-out",
+                        provider=",".join(providers) or "none",
+                        detail=head_error,
+                        ok=False,
+                    )
+                )
+                return actions
             while deficit > 0 and providers:
                 provider = providers[index % len(providers)]
                 index += 1
@@ -1170,8 +1243,7 @@ class AutoSpawner:
                     region="unknown",
                     ttl_seconds=self.settings.spawner_default_ttl_seconds,
                     labels={"origin": "scale-out"},
-                    head_url=self.settings.public_base_url
-                    or f"http://{self.settings.head_host}:{self.settings.head_port}",
+                    head_url=head_url,
                     mesh_token=self.settings.mesh_token,
                 )
                 result = await self.provision(request)

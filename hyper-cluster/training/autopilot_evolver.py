@@ -44,6 +44,7 @@ from training.prompt_evolver import (
 )
 from training.self_play import SelfPlayEngine
 from training.synthetic_data import build_dataset, mine_seeds
+from training.torch_qlora import AdapterArtifact
 
 LOGGER = get_logger("training.autopilot_evolver")
 
@@ -107,7 +108,10 @@ class AutopilotEvolver:
         client: Any,
         *,
         memory: Any | None = None,
-        trainer: DistributedTrainer | None = None,
+        #: Either a DistributedTrainer (math backend) or an AutoTrainer that
+        #: picks torch/math by capability.  The autopilot only relies on the
+        #: shared interface, so it does not need to know which one it holds.
+        trainer: DistributedTrainer | Any | None = None,
         self_play: SelfPlayEngine | None = None,
         streamer: CheckpointStreamer | None = None,
         prompt_evolver: PromptEvolver | None = None,
@@ -405,13 +409,17 @@ class AutopilotEvolver:
 
         # --- 6. merge + push ----------------------------------------- #
         self.phase = "merge"
-        artifact = self._artifact(training)
+        # The trainer's own artifact first (could be a numpy BrainArtifact or a
+        # real AdapterArtifact); the wire form the workers understand is derived
+        # from it.  Keeping them separate means the *adapter itself* goes to the
+        # cloud, while the *hot-reload payload* stays the mesh's format.
+        artifact = self.trainer.last_artifact if self.trainer is not None else None
         if artifact is not None:
-            report.artifact_sha256 = artifact.sha256()
-            pushed = await self._push(training, artifact)
-            report.pushed = pushed
+            wire = self._artifact(training)
+            report.artifact_sha256 = wire.sha256() if wire is not None else ""
+            report.pushed = await self._push(training, artifact)
             # --- 7. hot-reload the upgraded brain -------------------- #
-            report.hot_reloaded = await self._hot_reload(artifact)
+            report.hot_reloaded = await self._hot_reload(wire) if wire is not None else []
         return report
 
     # ------------------------------------------------------------------ #
@@ -432,10 +440,23 @@ class AutopilotEvolver:
         return max(1, min(healthy, int(getattr(self.settings, "evolution_max_shards", 4))))
 
     def _artifact(self, training: TrainingReport) -> Any | None:
-        """The artifact (the merged brain) of the finished training run."""
+        """The artifact of the finished run, in the format the mesh ships.
+
+        Two shapes exist now: the numpy ``BrainArtifact`` written by the math
+        backend, and a real ``AdapterArtifact`` directory written by the torch
+        backend.  The latter is bridged into a ``BrainArtifact`` so the workers
+        keep using the single hot-reload path they already have.
+        """
         if self.trainer is None:
             return None
-        return self.trainer.last_artifact
+        artifact = self.trainer.last_artifact
+        if artifact is None:
+            return None
+        if type(artifact).__name__ == "AdapterArtifact":
+            from training.torch_qlora import adapter_to_brain_artifact
+
+            return adapter_to_brain_artifact(artifact)
+        return artifact
 
     async def _push(self, training: TrainingReport, artifact: Any) -> list[str]:
         """Push the checkpoint to the cloud."""
@@ -444,6 +465,25 @@ class AutopilotEvolver:
         pushed: list[str] = []
         try:
             checkpoint = None
+
+            # A real adapter (torch backend) streams as-is; the math backend
+            # still streams its numpy checkpoint.  Both are honest about which
+            # one went up.
+            if isinstance(artifact, AdapterArtifact):
+                payload = artifact.pack()
+                streamed = await self.streamer.push_bytes(
+                    training.steps or 0,
+                    payload,
+                    filename=f"adapter-{training.steps or 0:06d}.tar.gz",
+                    metadata={
+                        "loss": training.loss_end,
+                        "model": artifact.model,
+                        "backend": artifact.backend,
+                        **({"eval_loss_delta": artifact.eval.loss_delta} if artifact.eval else {}),
+                    },
+                )
+                return list(streamed.targets)
+
             from training.distributed_trainer import Checkpoint
 
             checkpoint = Checkpoint.latest(self.trainer.checkpoint_dir) if self.trainer else None
@@ -502,7 +542,22 @@ class AutopilotEvolver:
             "system_prompt": self.system_prompt,
             "cycles": len(self.reports),
             "last_report": self.last_report.to_dict() if self.last_report else None,
+            # M7 capability truth: which trainer the next cycle will use, and why.
+            "trainer": self._trainer_status(),
         }
+
+    def _trainer_status(self) -> dict[str, Any]:
+        """The trainer's own honest self-description (never assumed)."""
+        trainer = self.trainer
+        if trainer is None:
+            return {"backend": "", "reason": "no trainer configured"}
+        describe = getattr(trainer, "status", None)
+        if callable(describe):
+            try:
+                return describe()
+            except Exception:  # noqa: BLE001 - status must never fail the route
+                pass
+        return {"backend": getattr(trainer, "backend", "math") or "math", "reason": "trainer without status()"}
 
 
 __all__ = [

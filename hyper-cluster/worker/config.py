@@ -14,9 +14,24 @@ from typing import Any
 
 ENV_PREFIX = "HYPER_WORKER_"
 
+#: Model filename env names, canonical first.  ``MODEL_FILENAME`` is what the
+#: spawner has always exported (and ``bootstrap.sh`` writes); ``MODEL_FILE`` is
+#: the legacy bootstrap-only spelling.  Both are honoured so that no node
+#: silently falls back to the default 7B because of a name mismatch (M6).
+MODEL_FILENAME_KEYS: tuple[str, ...] = ("MODEL_FILENAME", "MODEL_FILE")
+
 
 def _env(name: str, default: str | None = None) -> str | None:
     return os.environ.get(f"{ENV_PREFIX}{name}", default)
+
+
+def _env_aliased(names: tuple[str, ...], default: str = "") -> str:
+    """First non-empty value among ``names`` (canonical name first)."""
+    for name in names:
+        value = _env(name)
+        if value is not None and value.strip():
+            return value.strip()
+    return default
 
 
 def _int(name: str, default: int) -> int:
@@ -123,7 +138,9 @@ class WorkerConfig:
             session_ends_at=_float("SESSION_ENDS_AT", 0.0),
             model_path=_env("MODEL_PATH", "") or "",
             model_repo=_env("MODEL_REPO", "") or "",
-            model_filename=_env("MODEL_FILENAME", "") or "",
+            # Canonical name + legacy alias (M6).  An empty value must never
+            # masquerade as "no model", so we fall through to the alias first.
+            model_filename=_env_aliased(MODEL_FILENAME_KEYS),
             model_family=_env("MODEL_FAMILY", "qwen2") or "qwen2",
             model_params_b=_float("MODEL_PARAMS_B", 7.0),
             model_sha256=_env("MODEL_SHA256", "") or "",

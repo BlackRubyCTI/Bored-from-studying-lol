@@ -75,6 +75,74 @@ class CheckpointStreamer:
     def _names(self, step: int) -> tuple[str, str]:
         return f"checkpoint-{step:06d}.npz", f"checkpoint-{step:06d}.json"
 
+    async def push_bytes(
+        self,
+        step: int,
+        payload: bytes,
+        *,
+        filename: str,
+        metadata: dict[str, Any] | None = None,
+        targets: tuple[str, ...] = ("drive", "hub"),
+    ) -> StreamedCheckpoint:
+        """Upload an already-serialised artifact (a real adapter, not a matrix).
+
+        The math backend streams a numpy matrix; the torch backend produces a
+        directory of safetensors.  Both must be able to reach the cloud, and both
+        must record what was actually sent -- so this shares the exact upload and
+        bookkeeping path of :meth:`push` instead of inventing a second one.
+        """
+        checksum = sha256_bytes(payload)
+        meta = {
+            "step": int(step),
+            "loss": float((metadata or {}).get("loss") or 0.0),
+            "sha256": checksum,
+            "bytes": len(payload),
+            "created_at": now_s(),
+            "kind": "adapter",
+            **{k: v for k, v in (metadata or {}).items() if k != "loss"},
+        }
+        meta_payload = json.dumps(meta, indent=2).encode("utf-8")
+        json_name = f"checkpoint-{int(step):06d}.json"
+        streamed = StreamedCheckpoint(
+            step=int(step),
+            loss=float(meta["loss"]),
+            sha256=checksum,
+            bytes_sent=len(payload),
+        )
+        if "drive" in targets and self.drive is not None:
+            try:
+                folder_id = await self.drive.ensure_folder(self.drive_folder)
+                receipt = await self.drive.upload(
+                    f"{self.prefix}/{filename}",
+                    payload,
+                    folder_id=folder_id,
+                    app_properties={"kind": "adapter", "step": str(step), "sha256": checksum},
+                    mime_type="application/octet-stream",
+                )
+                if receipt.ok:
+                    streamed.targets.append("drive")
+                    await self.drive.upload(
+                        f"{self.prefix}/{json_name}",
+                        meta_payload,
+                        folder_id=folder_id,
+                        app_properties={"kind": "checkpoint-meta", "step": str(step)},
+                        mime_type="application/json",
+                    )
+                else:
+                    LOGGER.warning("adapter drive push failed", extra={"hc_error": receipt.error})
+            except Exception as exc:  # noqa: BLE001 - the cloud is optional
+                LOGGER.warning("adapter drive push failed", extra={"hc_error": str(exc)})
+        if "hub" in targets and self.hub is not None and self.hub_repo:
+            receipt = await self.hub.upload_file(
+                self.hub_repo, f"{self.prefix}/{filename}", payload, message=f"adapter {step}"
+            )
+            if receipt.ok:
+                streamed.targets.append("hub")
+                await self.hub.upload_file(
+                    self.hub_repo, f"{self.prefix}/{json_name}", meta_payload, message=f"adapter {step} metadata"
+                )
+        return streamed
+
     async def push(
         self,
         step: int,
@@ -218,7 +286,11 @@ class CheckpointStreamer:
             try:
                 folder_id = await self.drive.ensure_folder(self.drive_folder)
                 for item in await self.drive.list_folder(folder_id):
-                    if str(item.get("name", "")).endswith(".npz"):
+                    name = str(item.get("name", ""))
+                    # Both checkpoint shapes live in the same folder: the math
+                    # backend's numpy matrix (.npz) and the torch backend's real
+                    # adapter archive (.tar.gz).
+                    if name.endswith((".npz", ".tar.gz")):
                         found.append(
                             {
                                 "path": item.get("name"),

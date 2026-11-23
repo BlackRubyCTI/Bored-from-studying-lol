@@ -37,6 +37,12 @@ def _settings(tmp_path) -> Settings:
         evolution_prompt_enabled=False,
         council_size=3,
         council_critique_rounds=0,
+        # This test proves the *preemption contract*, which is identical for both
+        # trainers.  It is pinned to the math backend so it stays a fast, exact
+        # test of the interrupt path rather than a slow torch training run; the
+        # torch trainer's own preemption latency is covered in
+        # tests/test_m7_qlora.py::test_preemption_interrupts_qlora_under_two_seconds.
+        evolution_train_backend="math",
     )
 
 

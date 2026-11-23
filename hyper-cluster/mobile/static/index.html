@@ -37,6 +37,11 @@
 
   <!-- ── the telemetry strip ─────────────────────────────────────── -->
   <section id="telemetry" class="telemetry" aria-label="live telemetry">
+    <!-- Capability truth (M6): says out loud which backend is answering. -->
+    <div class="capability" id="m-capability" role="status" aria-live="polite">
+      <span class="capability-dot" id="m-capability-dot" aria-hidden="true"></span>
+      <span id="m-capability-label">checking…</span>
+    </div>
     <div class="metric"><span class="metric-value" id="m-workers">0</span><span class="metric-label">workers</span></div>
     <div class="metric"><span class="metric-value" id="m-vram">0</span><span class="metric-label">GB vram</span></div>
     <div class="metric"><span class="metric-value" id="m-tps">0</span><span class="metric-label">tok/s</span></div>

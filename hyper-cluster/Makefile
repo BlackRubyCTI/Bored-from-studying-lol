@@ -5,7 +5,7 @@ PORT ?= 8080
 WORKER_PORT ?= 8081
 DASHBOARD_PORT ?= 8082
 
-.PHONY: help venv install check run run-worker dashboard test lint fmt smoke smoke-m1 smoke-m2 smoke-m3 smoke-m4 smoke-m5 worker-bootstrap worker-check install-all clean
+.PHONY: help venv install check run run-worker dashboard test lint fmt smoke smoke-m1 smoke-m2 smoke-m3 smoke-m4 smoke-m5 smoke-m6 smoke-m7 worker-bootstrap worker-check install-all clean
 
 help:
 	@echo "Hyper-Cluster Omega"
@@ -22,6 +22,8 @@ help:
 	@echo "  make smoke-m3         run the Milestone 3 smoke test (auto-scaler + spawner)"
 	@echo "  make smoke-m4         run the Milestone 4 smoke test (memory + self-evolution)"
 	@echo "  make smoke-m5         run the Milestone 5 smoke test (mobile mission control)"
+	@echo "  make smoke-m6         run the Milestone 6 smoke test (truth + real jail)"
+	@echo "  make smoke-m7         run the Milestone 7 smoke test (real QLoRA + eval delta)"
 	@echo "  make install-all      run the interactive installer (the phone setup)"
 	@echo "  make lint             run ruff over the whole project"
 	@echo "  make clean            remove caches"
@@ -76,6 +78,12 @@ smoke-m4:
 
 smoke-m5:
 	$(BIN)/python scripts/smoke_m5.py
+
+smoke-m6:
+	$(BIN)/python scripts/smoke_m6.py
+
+smoke-m7:
+	$(BIN)/python scripts/smoke_m7.py
 
 install-all:
 	bash install_all.sh

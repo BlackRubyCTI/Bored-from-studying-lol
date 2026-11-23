@@ -93,6 +93,11 @@ async def main() -> int:
         evolution_max_shards=2,
         evolution_prompt_enabled=False,
         evolution_checkpoint_dir=str(data_dir / "checkpoints"),
+        # This milestone's scenario shards a *matrix* across the mesh
+        # (``slow_shard`` returns W), which is the math backend's contract.  Pin
+        # it so the test stays exact; the real QLoRA path has its own smoke
+        # (scripts/smoke_m7.py) and its own preemption assertion.
+        evolution_train_backend="math",
         drive_token="smoke-token",
         drive_api_base=cloud.drive_api_base,
         drive_upload_base=cloud.drive_upload_base,

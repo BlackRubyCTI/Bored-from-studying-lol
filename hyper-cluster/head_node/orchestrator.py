@@ -70,6 +70,11 @@ VERIFICATION_BUDGET_SECONDS = 25.0
 #: Similarity above which an edge draft is considered "confirmed" by the cluster.
 VERIFICATION_THRESHOLD = 0.55
 
+#: Backends whose output is actual model inference.  Anything else (notably
+#: ``simulator``, and the honest ``unknown``) means the cluster cannot claim
+#: model-grade answers for this milestone's status contract.
+REAL_BACKENDS = frozenset({"llama.cpp", "upstream", "vllm", "transformers"})
+
 
 @dataclass
 class RequestStream:
@@ -218,18 +223,36 @@ class Orchestrator:
         if not self.settings.evolution_enabled:
             return None
         from training.checkpoint_streamer import CheckpointStreamer
-        from training.distributed_trainer import DistributedTrainer
         from training.prompt_evolver import PromptEvolver, load_prompt_from_memory
         from training.self_play import SelfPlayEngine
+        from training.torch_qlora import AutoTrainer
 
-        trainer = DistributedTrainer(
+        # ``auto`` prefers real QLoRA when the stack is importable and falls back
+        # to the numpy ridge trainer otherwise.  The choice is made by probing
+        # the machine, and ``trainer.backend`` always says which one ran.
+        trainer = AutoTrainer(
             checkpoint_dir=self.settings.evolution_checkpoint_dir,
-            dim=self.settings.evolution_train_dim,
-            rank=self.settings.evolution_train_rank,
-            vocab_size=self.settings.evolution_train_vocab,
-            learning_rate=self.settings.evolution_train_learning_rate,
-            steps=self.settings.evolution_train_steps,
-            shard_fn=self._shard_dispatch,
+            preferred=self.settings.evolution_train_backend,
+            torch_kwargs={
+                "base_model": self.settings.evolution_base_model,
+                "steps": self.settings.evolution_train_steps,
+                "rank": self.settings.evolution_train_rank,
+                "learning_rate": self.settings.evolution_qlora_learning_rate,
+                "max_length": self.settings.evolution_qlora_max_length,
+                "eval_max_new_tokens": self.settings.evolution_eval_max_new_tokens,
+            },
+            math_kwargs={
+                "dim": self.settings.evolution_train_dim,
+                "rank": self.settings.evolution_train_rank,
+                "vocab_size": self.settings.evolution_train_vocab,
+                "learning_rate": self.settings.evolution_train_learning_rate,
+                "steps": self.settings.evolution_train_steps,
+                "shard_fn": self._shard_dispatch,
+            },
+        )
+        LOGGER.info(
+            "trainer selected",
+            extra={"hc_backend": trainer.backend, "hc_reason": trainer.choice.reason},
         )
         self_play = SelfPlayEngine(self.registry, self.client)
         streamer: CheckpointStreamer | None = None
@@ -1331,6 +1354,13 @@ class Orchestrator:
         totals = self.registry.totals()
         workers = self.registry.snapshot()
         edge_healthy = self.edge.healthy_providers()
+        # Capability truth: answers are "real" only when a healthy source
+        # runs an actual model (llama.cpp / upstream worker, or a healthy
+        # edge API).  Simulator-only clusters must say so, loudly.
+        healthy_backends = sorted({w.backend for w in workers if w.healthy and w.backend})
+        answers_are_real = bool(edge_healthy) or any(
+            backend in REAL_BACKENDS for backend in healthy_backends
+        )
         return ClusterStatus(
             cluster_name=self.settings.cluster_name,
             instance_id=self.settings.instance_id,
@@ -1351,6 +1381,8 @@ class Orchestrator:
             edge_providers=self.edge.provider_names(),
             edge_healthy=edge_healthy,
             workers=workers,
+            answers_are_real=answers_are_real,
+            backends=healthy_backends,
             mode=RequestMode.AUTO,
             autopilot=bool(self.autopilot is not None and self.autopilot.enabled),
             uptime_seconds=round(now_s() - self._started_at, 1),
@@ -1413,4 +1445,4 @@ def _consume_task_result(task: asyncio.Task[Any]) -> None:
         LOGGER.warning("background task failed", extra={"hc_error": str(exc)})
 
 
-__all__ = ["Orchestrator", "RequestStream", "VERIFICATION_THRESHOLD"]
+__all__ = ["Orchestrator", "REAL_BACKENDS", "RequestStream", "VERIFICATION_THRESHOLD"]

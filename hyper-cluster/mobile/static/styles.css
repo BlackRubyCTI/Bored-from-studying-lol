@@ -245,3 +245,36 @@ body {
   .telemetry { grid-template-columns: repeat(3, 1fr); }
   .telemetry .metric:nth-child(4), .telemetry .metric:nth-child(5) { display: none; }
 }
+
+/* ── capability badge (M6): simulator vs live model, never ambiguous ───── */
+.capability {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.6rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  border: 1px solid currentColor;
+  justify-self: start;
+}
+
+.capability-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: currentColor;
+  flex: 0 0 auto;
+}
+
+.capability-simulator {
+  color: #f0a03c;
+  background: rgba(240, 160, 60, 0.12);
+}
+
+.capability-live {
+  color: #35c48a;
+  background: rgba(53, 196, 138, 0.12);
+}
