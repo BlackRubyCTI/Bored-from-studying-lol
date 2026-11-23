@@ -1,0 +1,14 @@
+{
+  "name": "Hyper-Cluster Omega — Mission Control",
+  "short_name": "Hyper-Cluster",
+  "description": "Touch-first mission control for the Hyper-Cluster Omega compute pool.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#05070d",
+  "theme_color": "#05070d",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

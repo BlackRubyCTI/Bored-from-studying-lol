@@ -1,0 +1,82 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hyper-cluster-omega"
+version = "1.0.0"
+description = "Zero-limit autonomous AI operating system: headless GPU compute pool, sub-second inference, mobile mission control."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Hyper-Cluster Omega" }]
+keywords = ["llm", "orchestration", "inference", "autonomous", "gpu-pool"]
+classifiers = [
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Intended Audience :: Developers",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "pydantic>=2.7",
+  "httpx>=0.27",
+  "websockets>=12",
+  "python-multipart>=0.0.9",
+  "psutil>=5.9",
+  "numpy>=1.26",
+  "pyyaml>=6.0",
+  # OCI request signing (Oracle provisioner)
+  "cryptography>=42",
+]
+
+[project.optional-dependencies]
+memory = [
+  "faiss-cpu>=1.8",
+  "chromadb>=0.5",
+  "sentence-transformers>=3.0",
+]
+training = [
+  "torch>=2.3",
+  "transformers>=4.43",
+  "peft>=0.12",
+  "datasets>=2.20",
+  "accelerate>=0.33",
+]
+mesh = [
+  "paramiko>=3.4",
+]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.6",
+]
+all = [
+  "hyper-cluster-omega[memory,training,mesh,dev]",
+]
+
+[project.scripts]
+hyper-cluster = "head_node.serve:main"
+
+[tool.setuptools]
+packages = ["core", "head_node"]
+
+[tool.setuptools.package-data]
+"*" = ["*.json", "*.yaml", "*.sh", "*.html", "*.js", "*.css"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = ["ignore::DeprecationWarning"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501", "B008", "B904"]
