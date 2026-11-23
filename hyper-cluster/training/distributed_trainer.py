@@ -241,6 +241,24 @@ class TrainingReport:
     preempt_reason: str = ""
     duration_ms: float = 0.0
     started_at: float = field(default_factory=now_s)
+    # --- capability truth (M7): which trainer actually ran --------------- #
+    #: ``torch`` (real QLoRA) or ``math`` (numpy ridge fallback).
+    backend: str = ""
+    #: The concrete model + precision, e.g. ``tiny-llama-115k/.../fp32``.
+    model: str = ""
+    precision: str = ""
+    #: Where the base weights came from (``local-path``/``hf-cache``/``offline-selftest``).
+    base_model_source: str = ""
+    #: Path of the adapter directory, when a real adapter was written.
+    artifact_path: str = ""
+    #: ``train.<phase>`` / ``eval.<phase>``-style progress marker.
+    phase: str = ""
+    #: The before/after held-out measurement, if one was made.
+    eval: dict[str, Any] = field(default_factory=dict)
+    #: Anything a reader must know to interpret the numbers honestly.
+    notes: list[str] = field(default_factory=list)
+    #: Set when the trainer could not run at all (never a silent success).
+    error: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -259,6 +277,15 @@ class TrainingReport:
             "preempt_reason": self.preempt_reason,
             "duration_ms": round(self.duration_ms, 2),
             "started_at": self.started_at,
+            "backend": self.backend,
+            "model": self.model,
+            "precision": self.precision,
+            "base_model_source": self.base_model_source,
+            "artifact_path": self.artifact_path,
+            "phase": self.phase,
+            "eval": dict(self.eval),
+            "notes": list(self.notes),
+            "error": self.error,
         }
 
 

@@ -223,18 +223,36 @@ class Orchestrator:
         if not self.settings.evolution_enabled:
             return None
         from training.checkpoint_streamer import CheckpointStreamer
-        from training.distributed_trainer import DistributedTrainer
         from training.prompt_evolver import PromptEvolver, load_prompt_from_memory
         from training.self_play import SelfPlayEngine
+        from training.torch_qlora import AutoTrainer
 
-        trainer = DistributedTrainer(
+        # ``auto`` prefers real QLoRA when the stack is importable and falls back
+        # to the numpy ridge trainer otherwise.  The choice is made by probing
+        # the machine, and ``trainer.backend`` always says which one ran.
+        trainer = AutoTrainer(
             checkpoint_dir=self.settings.evolution_checkpoint_dir,
-            dim=self.settings.evolution_train_dim,
-            rank=self.settings.evolution_train_rank,
-            vocab_size=self.settings.evolution_train_vocab,
-            learning_rate=self.settings.evolution_train_learning_rate,
-            steps=self.settings.evolution_train_steps,
-            shard_fn=self._shard_dispatch,
+            preferred=self.settings.evolution_train_backend,
+            torch_kwargs={
+                "base_model": self.settings.evolution_base_model,
+                "steps": self.settings.evolution_train_steps,
+                "rank": self.settings.evolution_train_rank,
+                "learning_rate": self.settings.evolution_qlora_learning_rate,
+                "max_length": self.settings.evolution_qlora_max_length,
+                "eval_max_new_tokens": self.settings.evolution_eval_max_new_tokens,
+            },
+            math_kwargs={
+                "dim": self.settings.evolution_train_dim,
+                "rank": self.settings.evolution_train_rank,
+                "vocab_size": self.settings.evolution_train_vocab,
+                "learning_rate": self.settings.evolution_train_learning_rate,
+                "steps": self.settings.evolution_train_steps,
+                "shard_fn": self._shard_dispatch,
+            },
+        )
+        LOGGER.info(
+            "trainer selected",
+            extra={"hc_backend": trainer.backend, "hc_reason": trainer.choice.reason},
         )
         self_play = SelfPlayEngine(self.registry, self.client)
         streamer: CheckpointStreamer | None = None

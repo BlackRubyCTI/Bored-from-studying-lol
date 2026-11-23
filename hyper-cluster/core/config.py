@@ -282,6 +282,16 @@ class Settings:
     evolution_train_rank: int = 8
     evolution_train_dim: int = 128
     evolution_train_vocab: int = 128
+    # --- trainer selection (M7) --------------------------------------------- #
+    #: ``auto`` | ``torch`` | ``math``.  ``auto`` uses real QLoRA when
+    #: torch+transformers+peft import and falls back to the numpy ridge trainer.
+    evolution_train_backend: str = "auto"
+    #: A local base-model path or an already-cached HF id.  Empty -> a cached
+    #: model if any, else the labelled ``offline-selftest`` tiny model.
+    evolution_base_model: str = ""
+    evolution_qlora_learning_rate: float = 0.001
+    evolution_qlora_max_length: int = 96
+    evolution_eval_max_new_tokens: int = 12
     evolution_checkpoint_dir: str = ""
 
     # --- phone alerts (milestone 5) ----------------------------------------
@@ -516,6 +526,17 @@ class Settings:
             evolution_train_rank=_as_int(pick("evolution_train_rank"), defaults.evolution_train_rank),
             evolution_train_dim=_as_int(pick("evolution_train_dim"), defaults.evolution_train_dim),
             evolution_train_vocab=_as_int(pick("evolution_train_vocab"), defaults.evolution_train_vocab),
+            evolution_train_backend=(pick("evolution_train_backend", defaults.evolution_train_backend) or "auto"),
+            evolution_base_model=(pick("evolution_base_model", defaults.evolution_base_model) or ""),
+            evolution_qlora_learning_rate=_as_float(
+                pick("evolution_qlora_learning_rate"), defaults.evolution_qlora_learning_rate
+            ),
+            evolution_qlora_max_length=_as_int(
+                pick("evolution_qlora_max_length"), defaults.evolution_qlora_max_length
+            ),
+            evolution_eval_max_new_tokens=_as_int(
+                pick("evolution_eval_max_new_tokens"), defaults.evolution_eval_max_new_tokens
+            ),
             evolution_checkpoint_dir=pick("evolution_checkpoint_dir", "") or "",
             notifier_enabled=_as_bool(pick("notifier_enabled"), defaults.notifier_enabled),
             notifier_telegram_token=pick("notifier_telegram_token", "") or "",

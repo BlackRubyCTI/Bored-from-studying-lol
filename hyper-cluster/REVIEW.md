@@ -187,6 +187,78 @@ Cost of the boundary (same machine, `print(1+1)`):
   concurrency slots. It does **not** publish a p95 TTFT promise — that is M12's load-tested claim,
   and inventing one here would be exactly the kind of number this milestone exists to remove.
 
+## Milestone 7 — real learning, measured (not asserted)
+
+The M4 "trainer" was a numpy ridge regression. M7 replaces it with real QLoRA and
+keeps the ridge trainer as a capability-detected fallback. Nothing below is a
+projection: every number came from a run in this environment.
+
+### Environment (the limits that shape every claim)
+
+| Fact | Value | Consequence |
+|---|---|---|
+| `torch` | 2.15.0+cu132 | installed in `.venv` only (the `[training]` extra) |
+| `transformers` / `peft` / `accelerate` | 5.24.0 / 0.22.0 / 1.16.0 | the QLoRA stack runs |
+| `bitsandbytes` | 0.50.2 | **imports, but unusable** |
+| CUDA | **`torch.cuda.is_available() == False`** | 4-bit NF4 **cannot run**; `quantized_available()` is `False` |
+| `huggingface.co` | **unreachable** (PyPI is fine) | **no pretrained weights**; base model is a config-built 115k model |
+
+### What was measured
+
+| Claim | Measurement |
+|---|---|
+| A real adapter is produced | 4 files, **24,951 bytes**, sha256 `b296eaa8b5c3…`, incl. `adapter_model.safetensors` + `adapter_config.json` |
+| The LoRA tensors are really trained | 8 LoRA tensors, **6/8 non-zero** after training |
+| The adapter reloads | `PeftModel.from_pretrained` into a fresh `LlamaForCausalLM` restores the trained values exactly (a `lora_B` filled with 1.0 reads back `mean=1.000`) |
+| The adapter fits the serving path | bridged to `BrainArtifact`, **`worker/brain.py::Brain.load()` → `loaded: True`**, revision 1 |
+| Held-out learning is measured | loss **5.4765 → 4.7572** (Δ **+0.7193**), 3 held-out examples, prompt-grouped and deterministic |
+| The delta is stored with the artifact | `hyper_metrics.json` next to the adapter, `eval.loss_delta` read back from disk |
+| Preemption still holds | a chat stopped a QLoRA run in **205 ms** (budget **2,000 ms**) |
+| Torch is optional | `make test`: **414 passed, 1 skipped** with torch; **402 passed, 13 skipped** without (skip reasons name the missing extra) |
+
+Trainable parameters on the self-test model: **4,096 of 118,xxx (3.4 %)** with
+r=8 / α=16 on `q_proj` and `v_proj`.
+
+### Defects found and fixed while building M7
+
+1. **A silent no-op in the wrapper.** `AutoTrainer` delegated nothing, so
+   `trainer.shard_fn = ...` (what the autopilot and the M4/M7 tests do) wrote an
+   attribute the real trainer never saw. The preemption test caught it — training
+   never slowed down, so the interrupt had nothing to interrupt. `AutoTrainer` now
+   forwards attribute reads *and* writes to the trainer it selected.
+2. **The chooser could crash the control plane.** A broken torch install raised
+   out of `torch_available()`/`quantized_available()` during startup. Probing is
+   now fully guarded and degrades to the math backend.
+3. **A real adapter was invisible to the cloud.** The checkpoint streamer only
+   listed `.npz` files and only pushed numpy matrices, so every QLoRA run's
+   adapter silently never left the machine. Added `push_bytes()`, `pack()`
+   (one `.tar.gz`) and a listing filter that accepts adapter archives.
+4. **Checkpoints were under-counted.** The torch backend saved a real adapter but
+   never incremented `report.checkpoints`, so the cloud/checkpoint bookkeeping
+   reported zero for a run that had, in fact, checkpointed. The M4 smoke caught it.
+5. **A tiny model with the wrong vocabulary** (256 ids vs the 259-id byte
+   tokenizer) crashed in `F.embedding` with `IndexError: index out of range`. The
+   config is now sized from `BYTE_VOCAB_SIZE` and asserted against the tokenizer.
+
+### Clear-eyed about the claim
+
+* **This is not evidence that a production model improved.** The base model is a
+  115k-parameter self-test model built from a config. It proves the *pipeline* is
+  real — adapter produced, measured, reloaded, served, preempted — not that
+  7B-model quality rose. Every such report carries that sentence in `notes`, and
+  `test_the_report_labels_the_offline_self_test_model` fails if it is removed.
+* **A loss drop on 3 held-out examples is a weak signal.** It is a real
+  measurement of a real split, and it is reported with its sample size; it is not
+  a benchmark. `exact_match` and `token_f1` stayed at `0.0`, which is the honest
+  result for a byte-level 115k model, and the report shows it rather than showing
+  only the loss.
+* **4-bit is unverified.** The code path is selected automatically on a CUDA host,
+  but it was not executed here. REVIEW would be lying if M7 claimed QLoRA-4bit
+  throughput numbers.
+* **The fallback is not a toy that gets deleted.** On any machine without the
+  training extra, `AutoTrainer` selects the numpy trainer and says so with a
+  reason string. That path is covered by tests in both directions.
+
 ## Suggested next steps
 
 1. Wire a real backend (`HYPER_WORKER_BACKEND=llama.cpp` or `upstream`) and re-run M2/M4 against real tokens.
@@ -195,3 +267,8 @@ Cost of the boundary (same machine, `print(1+1)`):
    and move the denylist to an allowlist.
 3. Add a load test: 50 concurrent chats, 3 workers, assert p95 TTFT and zero dropped requests.
 4. Replace the hashed embedder with a real one (the interface is already pluggable) and measure recall.
+5. Point `HYPER_EVOLUTION_BASE_MODEL` at a cached 7B on a CUDA host and re-run
+   `make smoke-m7` — that is the first run whose eval delta says something about a
+   *production* model, and the first that exercises 4-bit NF4 for real.
+6. Grow the eval set beyond 12 hand-written pairs before trusting `exact_match`;
+   the harness (grouped split, deterministic seed) is ready for it.
