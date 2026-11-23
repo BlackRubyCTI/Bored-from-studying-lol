@@ -246,8 +246,10 @@ async def test_the_checkpoint_is_written_and_resumed(tmp_path: Path) -> None:
 
     resumed = DistributedTrainer(checkpoint_dir=tmp_path / "ckpt", steps=8, dim=32, rank=4)
     report = await resumed.train(_traces(), shards=1)
-    assert report.steps == 8
-    assert Checkpoint.latest(resumed.checkpoint_dir).step == 8
+    # every run does its own ``steps`` worth of work on top of the checkpoint
+    assert report.steps == 8 + 4
+    assert Checkpoint.latest(resumed.checkpoint_dir).step == 12
+    assert Checkpoint.latest(resumed.checkpoint_dir).step == report.steps
 
 
 async def test_a_preemption_stops_the_training(tmp_path: Path) -> None:
@@ -498,3 +500,22 @@ async def test_the_engine_does_not_loop_back_to_back(tmp_path: Path) -> None:
         assert now_s() - autopilot.last_activity < 10.0
     finally:
         await autopilot.aclose()
+
+
+async def test_every_cycle_keeps_learning(tmp_path: Path) -> None:
+    """Regression: a resumed cycle must still do a full run of training.
+
+    With an absolute step target the second cycle found the checkpoint at
+    ``steps`` and trained zero steps, re-merging identical weights: the
+    artifact hash never changed again after the first cycle.
+    """
+    autopilot, memory, _ = _autopilot(tmp_path)
+    memory.record_exchange("how do I deploy the cluster", "deploy the cluster with kubectl apply the helm chart")
+
+    first = await autopilot.run_cycle()
+    second = await autopilot.run_cycle()
+    assert first.error == "" and second.error == ""
+    assert first.training.steps == autopilot.trainer.steps
+    assert second.training.steps == 2 * autopilot.trainer.steps  # resumed, still 4 more steps
+    assert second.training.loss_end > 0.0
+    assert second.artifact_sha256  # a fresh, non-empty brain

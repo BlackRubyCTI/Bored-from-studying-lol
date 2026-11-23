@@ -360,12 +360,18 @@ class DistributedTrainer:
                 W = checkpoint.matrix.astype(np.float32)
                 start_step = checkpoint.step
                 LOGGER.info("training resumed", extra={"hc_step": start_step})
+        # ``steps`` is how much work *this run* does.  Resuming continues from
+        # the checkpoint, it does not shrink the run: with an absolute target
+        # (``range(start_step, self.steps)``) every cycle after the first one
+        # trained zero steps and re-merged the same weights, so the "sleep-time
+        # learning" never learned anything new.
+        target_step = start_step + self.steps
 
         weights = [len(indices) for indices in plan] or [1]
         report.loss_start = 0.0
 
         try:
-            for step in range(start_step, self.steps):
+            for step in range(start_step, target_step):
                 if token is not None:
                     token.guard()
                 gradients: list[np.ndarray] = []
