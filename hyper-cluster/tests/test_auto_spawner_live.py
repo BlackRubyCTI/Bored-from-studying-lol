@@ -248,6 +248,8 @@ async def test_kaggle_provision_pushes_a_kernel(settings, tmp_path, provider_api
     assert '"enable_gpu": true' in push["body"].replace("'", '"')
     assert "HYPER_WORKER_HEAD_URL" in push["body"]
     assert "HYPER_WORKER_MESH_TOKEN" in push["body"]
+    assert "git clone" in push["body"]
+    assert "./worker/bootstrap.sh --install" in push["body"]
     await spawner.aclose()
 
 
@@ -365,6 +367,7 @@ async def test_oracle_provision_signs_the_request(settings, tmp_path, provider_a
                     "compartment": "ocid1.compartment.oc1..omega",
                     "image": "ocid1.image.oc1..omega",
                     "availability_domain": "EU-FRANKFURT-1-AD-1",
+                    "subnet_id": "ocid1.subnet.oc1..omega",
                     "ssh_public_key": "ssh-ed25519 AAAA test",
                     "region": "eu-frankfurt-1",
                 },
@@ -379,6 +382,7 @@ async def test_oracle_provision_signs_the_request(settings, tmp_path, provider_a
     assert launch["shape"] == "VM.Standard.A1.Flex"
     assert launch["shapeConfig"] == {"ocpus": 4, "memoryInGBs": 24}
     assert launch["compartmentId"] == "ocid1.compartment.oc1..omega"
+    assert launch["createVnicDetails"]["subnetId"] == "ocid1.subnet.oc1..omega"
     posted = provider_api.find("/20160918/instances")[0]
     assert 'Signature version="1"' in posted["authorization"]
     assert "keyId=" in posted["authorization"]

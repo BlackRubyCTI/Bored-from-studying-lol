@@ -11,6 +11,7 @@
   var state = {
     head: localStorage.getItem(STORE + ".head") || window.location.origin,
     key: localStorage.getItem(STORE + ".key") || "",
+    admin: localStorage.getItem(STORE + ".admin") || "",
     voice: localStorage.getItem(STORE + ".voice") || "",
     council: localStorage.getItem(STORE + ".council") === "1",
     autopilot: localStorage.getItem(STORE + ".autopilot") === "1",
@@ -33,6 +34,7 @@
   function save() {
     localStorage.setItem(STORE + ".head", state.head);
     localStorage.setItem(STORE + ".key", state.key);
+    localStorage.setItem(STORE + ".admin", state.admin);
     localStorage.setItem(STORE + ".voice", state.voice);
     localStorage.setItem(STORE + ".council", state.council ? "1" : "0");
     localStorage.setItem(STORE + ".autopilot", state.autopilot ? "1" : "0");
@@ -41,9 +43,18 @@
   }
   function status(text) { $("status-line").textContent = text || ""; }
 
+  function endpoint(path) {
+    var base = (state.head || "").trim().replace(/\/+$/, "");
+    if (base && base !== window.location.origin) {
+      return base + path;
+    }
+    return "/api" + path;
+  }
+
   function headers(extra) {
     var out = { "content-type": "application/json" };
     if (state.key) out["x-api-key"] = state.key;
+    if (state.admin || state.key) out["x-admin-token"] = state.admin || state.key;
     if (extra) Object.keys(extra).forEach(function (k) { out[k] = extra[k]; });
     return out;
   }
@@ -52,7 +63,7 @@
     var opts = options || {};
     opts.headers = headers(opts.headers);
     opts.method = opts.method || "GET";
-    return fetch("/api" + path, opts).then(function (response) {
+    return fetch(endpoint(path), opts).then(function (response) {
       if (!response.ok) {
         return response.text().then(function (body) {
           throw new Error(body && body.length ? body.slice(0, 200) : "HTTP " + response.status);
@@ -110,7 +121,7 @@
     };
 
     var answer = "";
-    fetch("/api/v1/chat/stream", {
+    fetch(endpoint("/v1/chat/stream"), {
       method: "POST",
       headers: headers(),
       body: JSON.stringify(payload)
@@ -144,8 +155,11 @@
         } else if (kind === "done") {
           if (data.text && !answer) { answer = data.text; setBubble(bubble, answer); }
           finish();
+        } else if (kind === "deferred") {
+          setBubble(bubble, data.message || "⏳ Request queued for replay (" + (data.request_id || "pending") + ").");
+          finish();
         } else if (kind === "error") {
-          setBubble(bubble, "⚠️ " + (data.error || "the cluster failed"));
+          setBubble(bubble, "⚠️ " + (data.message || data.error || "the cluster failed"));
           finish();
         }
       }
@@ -284,7 +298,7 @@
       var form = new FormData();
       form.append("file", file, file.name);
       status("indexing " + file.name + "…");
-      fetch("/api/v1/memory/documents", {
+      fetch(endpoint("/v1/memory/documents"), {
         method: "POST",
         headers: state.key ? { "x-api-key": state.key } : {},
         body: form
@@ -315,6 +329,7 @@
   function init() {
     $("set-head").value = state.head;
     $("set-key").value = state.key;
+    $("set-admin").value = state.admin;
     setSwitch($("sw-council"), state.council);
     setSwitch($("sw-autopilot"), state.autopilot);
     setSwitch($("sw-rag"), state.rag);
@@ -397,6 +412,7 @@
     $("btn-save").addEventListener("click", function () {
       state.head = $("set-head").value.trim() || window.location.origin;
       state.key = $("set-key").value.trim();
+      state.admin = $("set-admin").value.trim();
       state.voice = $("set-voice").value;
       save();
       $("settings").classList.add("hidden");
@@ -404,9 +420,11 @@
     });
     $("btn-logout").addEventListener("click", function () {
       state.key = "";
+      state.admin = "";
       $("set-key").value = "";
+      $("set-admin").value = "";
       save();
-      status("the key was cleared");
+      status("the keys were cleared");
     });
 
     document.querySelectorAll("#suggestions .chip").forEach(function (chip) {
